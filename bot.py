@@ -21,6 +21,8 @@ async def totime(interaction: discord.Interaction):
 
 @client.event
 async def on_ready():
+    await tree.sync()
     print(f"ログインしました: {client.user}")
 
 client.run(TOKEN)
+
