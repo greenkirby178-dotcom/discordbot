@@ -16,7 +16,8 @@ async def to(interaction: discord.Interaction):
 
 @tree.command(name="totime", description="時間をランダムで決めます")
 async def totime(interaction: discord.Interaction):
-    result = random.choice(["1分", "5分", "10分", "1時間", "1日","1週間","3週間","一か月","半年","一年","追放"])
+    n = random.randint(1,86400)
+    result = random.choice([str(n) + "秒","追放",str(n) + "秒",str(n) + "秒",str(n) + "秒",])
     await interaction.response.send_message(result)
 
 @client.event
