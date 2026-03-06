@@ -23,7 +23,7 @@ async def totime(interaction: discord.Interaction):
 @tree.command(name="cc",description="既存48コースの中から一つコースを選びます")
 async def cc(interaction: discord.Interaction):
     course_list = ["mks","wp","ssc","tr","mc","th","tm","sgf","sa","ds","ed","mw","cc","bdd","bc","rr","yc","ea","dd","dmc",
-    "bp","cl","ww","ac","rmmm","rmc","rccb","rtt","rddd","rdp3","rRRy","rdkj","rwc","rsl","rmp","ryv","rttc","rpps","rgv",
+    "bp","cl","ww","ac","rmmm","rmc","rccb","rtt","rddd","rdp3","rRRy","rdkj","rws","rsl","rmp","ryv","rttc","rpps","rgv",
     "rrrd","dwgm","drr","diio","dhc","dnbc","drir","dsbs","dbb"]
     result = random.choice(course_list)
     await interaction.response.send_message(result)
@@ -32,7 +32,7 @@ async def cc(interaction: discord.Interaction):
 async def dlcc(interaction: discord.Interaction):
     course_list = ["bpp","btc","bcmo","bcma","btb","bsr","bsg","bnh","bnym","bmc3","bkd","bwp","bsst","bsl","bmg","bshs","bll","bbl","brrm","bmt",
     "bbb","bpg","bmm","brr7","bad","brp","dks","yi","bbr","bmc","bws","bssy","batd","bdcr","bmh","bscs","blal","bsw","bkc",
-    "vv","bra","dkm","ddtc","dppc","bmd","briw","bbc3","brrw"]
+    "vv","bra","dkm","ddct","dppc","bmd","briw","bbc3","brrw"]
     result = random.choice(course_list)
     await interaction.response.send_message(result)
 
