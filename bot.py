@@ -32,7 +32,7 @@ async def cc(interaction: discord.Interaction):
 async def dlcc(interaction: discord.Interaction):
     course_list = ["bpp","btc","bcmo","bcma","btb","bsr","bsg","bnh","bnym","bmc3","bkd","bwp","bsst","bsl","bmg","bshs","bll","bbl","brrm","bmt",
     "bbb","bpg","bmm","brr7","bad","brp","dks","yi","bbr","bmc","bws","bssy","batd","bdcr","bmh","bscs","blal","bsw","bkc",
-    "vv","bra","dkm","ddct","dppc","bmd","briw","bbc3","brrw"]
+    "vv","bra","dkm","bdct","bppc","bmd","briw","bbc3","brrw"]
     result = random.choice(course_list)
     await interaction.response.send_message(result)
 
