@@ -1,4 +1,5 @@
 import asyncio
+import re
 import random
 import discord
 from discord import app_commands
@@ -7,6 +8,7 @@ import os
 TOKEN = os.getenv("TOKEN")  # Render用
 
 intents = discord.Intents.default()
+intents.message_content = True
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
 
@@ -90,6 +92,9 @@ async def on_message(message):
             await message.delete()
         except discord.Forbidden:
             pass
+        return
+
+    await handle_arc(message)
 
 @tree.command(
     name="chatmute",
@@ -199,15 +204,134 @@ async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
     await interaction.response.send_message(result)
 
 
-@tree.command(name="mc", description="挙手テーブルの枠を表示します（実験版）")
+TABLE_FOOTER = "補欠: Substitute, 仮: Tentative | AR挙手テーブル"
+table_states = {}
+table_locks = {}
+
+
+def table_embed_list(slots):
+    embeds = []
+    embed = discord.Embed(title="6v6 War List", colour=discord.Colour(0xF1E05A))
+    for number, users in sorted(slots.items()):
+        if len(embed.fields) == 25:
+            embeds.append(embed)
+            embed = discord.Embed(title="6v6 War List（続き）", colour=discord.Colour(0xF1E05A))
+        embed.add_field(name=f"{number}@{max(0, 6 - len(users))}",
+                        value="\n".join(f"> <@{uid}>" for uid in users) or "参加者なし", inline=False)
+    if not slots:
+        embed.description = "まだ挙手はありません。`/c 数字` または `!arc 数字` で参加できます。"
+    embed.set_footer(text=TABLE_FOOTER)
+    embeds.append(embed)
+    if sum(len(e) for e in embeds) > 5900:
+        raise ValueError("テーブルが表示上限に達しました。/md でリセットしてください。")
+    return embeds
+
+
+async def get_table_state(channel):
+    if channel.id in table_states:
+        return table_states[channel.id]
+    state = {"message": None, "slots": {}}
+    # 再起動後は、直近100件にある自分のテーブルから参加情報を復元する。
+    async for message in channel.history(limit=100):
+        if message.author.id != client.user.id or not message.embeds:
+            continue
+        if not any(e.footer.text == TABLE_FOOTER for e in message.embeds):
+            continue
+        state["message"] = message
+        for embed in message.embeds:
+            for field in embed.fields:
+                number = int(field.name.split("@")[0])
+                state["slots"][number] = [int(x) for x in re.findall(r"<@!?(\d+)>", field.value)]
+        break
+    table_states[channel.id] = state
+    return state
+
+
+async def update_table(channel, state, slots):
+    embeds = table_embed_list(slots)
+    if state["message"] is not None:
+        try:
+            await state["message"].edit(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+        except discord.NotFound:
+            state["message"] = None
+    if state["message"] is None:
+        state["message"] = await channel.send(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+    state["slots"] = slots
+
+
+async def join_table(channel, user_id, number):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        slots = {key: list(users) for key, users in state["slots"].items()}
+        users = slots.setdefault(number, [])
+        if user_id in users:
+            return f"{number}の欄には既に挙手しています。"
+        if len(users) >= 6:
+            return f"{number}の欄は定員6人に達しています。"
+        users.append(user_id)
+        await update_table(channel, state, slots)
+        return f"{number}の欄に挙手しました。残り{6 - len(users)}人です。"
+
+
+@tree.command(name="mc", description="挙手テーブルを表示します")
+@app_commands.guild_only()
 async def mc(interaction: discord.Interaction):
-    embed = discord.Embed(
-        title="6v6 War List",
-        description="挙手テーブル（実験版）",
-        colour=discord.Colour(0xF1E05A),
-    )
-    embed.set_footer(text="補欠: Substitute, 仮: Tentative")
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.defer(ephemeral=True)
+    async with table_locks.setdefault(interaction.channel_id, asyncio.Lock()):
+        state = await get_table_state(interaction.channel)
+        await update_table(interaction.channel, state, state["slots"])
+    await interaction.followup.send("挙手テーブルを表示しました。", ephemeral=True)
+
+
+@tree.command(name="md", description="このチャンネルの挙手テーブルをリセットします")
+@app_commands.guild_only()
+async def md(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    async with table_locks.setdefault(interaction.channel_id, asyncio.Lock()):
+        state = await get_table_state(interaction.channel)
+        await update_table(interaction.channel, state, {})
+    await interaction.followup.send("挙手テーブルをリセットしました。", ephemeral=True)
+
+
+@tree.command(name="c", description="指定した数字の欄に挙手します")
+@app_commands.guild_only()
+@app_commands.describe(number="挙手する欄の数字（0〜48）")
+async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48]):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await join_table(interaction.channel, interaction.user.id, number)
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+async def handle_arc(message):
+    parts = message.content.split()
+    if not parts or parts[0] != "!arc":
+        return
+    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
+        await message.reply("使い方：`!arc 数字`（0〜48の整数）", mention_author=False)
+        return
+    try:
+        result = await join_table(message.channel, message.author.id, int(parts[1]))
+    except ValueError as error:
+        result = str(error)
+    await message.reply(result, mention_author=False)
+
+
+@tree.error
+async def table_command_error(interaction: discord.Interaction, error):
+    if interaction.command is None or interaction.command.name not in ("mc", "md", "c"):
+        print(error)
+        return
+    original = getattr(error, "original", error)
+    text = "❌ テーブルの更新に失敗しました。Botの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」「メッセージ履歴を読む」権限を確認してください。"
+    print(f"Table command failed: {original}")
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
 
 
 client.run(TOKEN)
