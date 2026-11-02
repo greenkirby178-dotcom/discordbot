@@ -1,3 +1,4 @@
+import asyncio
 import random
 import discord
 from discord import app_commands
@@ -90,6 +91,117 @@ async def allcc(interaction: discord.Interaction):
 async def on_ready():
     await tree.sync()
     print(f"ログインしました: {client.user}")
+
+@client.event
+async def on_message(message):
+
+    # DMとBotの発言は対象外
+    if message.guild is None or message.author.bot:
+        return
+
+    role = discord.utils.get(message.guild.roles, name="チャット規制")
+
+    if role is not None and role in message.author.roles:
+        try:
+            await message.delete()
+        except discord.Forbidden:
+            pass
+
+@tree.command(
+    name="chatmute",
+    description="指定したユーザーをチャット規制します"
+)
+@app_commands.guild_only()
+@app_commands.describe(
+    member="規制するユーザー",
+    minutes="規制時間(分)"
+)
+async def chatmute(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    minutes: int
+):
+    # 管理者または「二刀流モデレーター」ロールを持っているか確認
+    moderator_role = discord.utils.get(interaction.guild.roles, name="二刀流モデレーター")
+
+    is_admin = interaction.user.guild_permissions.administrator
+    is_moderator = moderator_role in interaction.user.roles if moderator_role else False
+
+    if not (is_admin or is_moderator):
+        await interaction.response.send_message(
+            "❌ このコマンドを使用する権限がありません。",
+            ephemeral=True
+        )
+        return
+    # 規制時間のチェック
+    if minutes < 1 or minutes > 60:
+        await interaction.response.send_message(
+            "❌ 規制時間は1〜60分の間で指定してください。",
+            ephemeral=True
+        )
+        return
+    role = discord.utils.get(interaction.guild.roles, name="チャット規制")
+
+    if role is None:
+        await interaction.response.send_message(
+            "❌ 『チャット規制』ロールが見つかりません。",
+            ephemeral=True
+        )
+        return
+
+    if role in member.roles:
+        await interaction.response.send_message(
+            "⚠️ そのユーザーは既にチャット規制中です。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer()
+
+    try:
+        await member.add_roles(role)
+
+    except discord.Forbidden:
+        await interaction.followup.send(
+            "❌ ロールを付与できません。\nBotのロール順位を確認してください。",
+            ephemeral=True
+        )
+        return
+
+    await interaction.followup.send(
+        f"🚫 {member.mention} はチャット規制を受けました。\n"
+        f"**{minutes}分間** {member.display_name} のチャットを規制します。"
+    )
+
+    # 指定時間待機
+    await asyncio.sleep(minutes * 60)
+
+    # 最新のメンバー情報を取得
+    member = await interaction.guild.fetch_member(member.id)
+
+    # まだロールが付いていれば解除
+    if role in member.roles:
+
+        try:
+            await member.remove_roles(role)
+
+            await interaction.channel.send(
+                f"✅ {member.mention} のチャット規制を解除しました。"
+            )
+
+        except discord.Forbidden:
+            pass
+
+@chatmute.error
+async def chatmute_error(interaction: discord.Interaction, error):
+
+    if isinstance(error, app_commands.MissingPermissions):
+        await interaction.response.send_message(
+            "❌ このコマンドは管理者のみ使用できます。",
+            ephemeral=True
+        )
+    else:
+        print(error)
 
 client.run(TOKEN)
 
