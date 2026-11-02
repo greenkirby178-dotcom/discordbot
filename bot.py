@@ -338,6 +338,112 @@ def regular_users(slots, statuses, number):
             if statuses.get(number, {}).get(uid, "regular") == "regular"]
 
 
+signup_role_locks = {}
+signup_role_usage = {}
+
+
+async def sync_signup_roles(channel, slots):
+    """AR数字ロールを、同じサーバー内の全募集の参加者と同期する。"""
+    guild = channel.guild
+    async with signup_role_locks.setdefault(guild.id, asyncio.Lock()):
+        if guild.id not in signup_role_usage:
+            # 再起動後も別チャンネルで使用中のロールを消さないよう復元する。
+            usage = {}
+            candidates = {c.id: c for c in [*guild.text_channels, *guild.threads, channel]}
+            for candidate in candidates.values():
+                permissions = candidate.permissions_for(guild.me)
+                if not (permissions.view_channel and permissions.read_message_history):
+                    continue
+                recovered = await get_table_state(candidate)
+                if recovered["active"]:
+                    usage[candidate.id] = {n: set(users) for n, users in recovered["slots"].items()}
+            signup_role_usage[guild.id] = usage
+        usage = signup_role_usage[guild.id]
+        before = {}
+        for table in usage.values():
+            for number, users in table.items():
+                before.setdefault(number, set()).update(users)
+        proposed = dict(usage)
+        proposed[channel.id] = {n: set(users) for n, users in slots.items()}
+        desired = {}
+        for table in proposed.values():
+            for number, users in table.items():
+                desired.setdefault(number, set()).update(users)
+        numbers = set(before) | set(desired)
+        if not numbers:
+            usage[channel.id] = proposed[channel.id]
+            return
+        if not guild.me.guild_permissions.manage_roles:
+            raise ValueError("❌ Botに『ロールの管理』権限を付けてください。")
+        roles = {role.name: role for role in await guild.fetch_roles()}
+        for number in numbers:
+            role = roles.get(f"AR{number}")
+            if role is not None and (role.managed or role >= guild.me.top_role or role.permissions.value != 0):
+                raise ValueError(f"❌ AR{number}を管理できません。Botより下の、権限を持たない通常ロールにしてください。")
+        members = {}
+        async def member_for(uid):
+            if uid not in members:
+                try:
+                    members[uid] = await guild.fetch_member(uid)
+                except discord.NotFound:
+                    members[uid] = None
+            return members[uid]
+        # 作成・付与・取り外しが失敗した場合は、可能な限り変更を戻す。
+        undo = []
+        created = []
+        try:
+            for number in sorted(numbers):
+                wanted = desired.get(number, set())
+                role = roles.get(f"AR{number}")
+                if wanted and role is None:
+                    role = await guild.create_role(
+                        name=f"AR{number}", permissions=discord.Permissions.none(),
+                        mentionable=False, reason="募集参加者の自動ロール"
+                    )
+                    roles[role.name] = role
+                    created.append(role)
+                if role is None:
+                    continue
+                for uid in sorted(wanted):
+                    member = await member_for(uid)
+                    if member is None:
+                        raise ValueError("❌ 対象メンバーがサーバーに見つかりません。")
+                    if role not in member.roles:
+                        await member.add_roles(role, reason="募集への挙手")
+                        undo.append((member, role, "remove"))
+                for uid in sorted(before.get(number, set()) - wanted):
+                    member = await member_for(uid)
+                    if member is not None and role in member.roles:
+                        await member.remove_roles(role, reason="募集からの退出")
+                        undo.append((member, role, "add"))
+        except (discord.HTTPException, ValueError) as error:
+            for member, role, action in reversed(undo):
+                try:
+                    if action == "remove":
+                        await member.remove_roles(role, reason="募集更新の取り消し")
+                    else:
+                        await member.add_roles(role, reason="募集更新の取り消し")
+                except discord.HTTPException:
+                    pass
+            for role in created:
+                try:
+                    await role.delete(reason="募集更新の取り消し")
+                except discord.HTTPException:
+                    pass
+            raise ValueError("❌ 募集ロールの更新に失敗しました。Botのロール管理権限とロール順位を確認してください。") from error
+        # 全チャンネルを合わせて0人になった数字だけロールを削除する。
+        for number in sorted(numbers):
+            role = roles.get(f"AR{number}")
+            if not desired.get(number) and role is not None:
+                try:
+                    await role.delete(reason="募集参加者が0人になったため")
+                except discord.NotFound:
+                    pass
+                except discord.HTTPException as error:
+                    raise ValueError(f"❌ AR{number}の削除に失敗しました。Botのロール管理権限と順位を確認してください。") from error
+        usage[channel.id] = proposed[channel.id]
+
+
 async def update_table(channel, state, slots, statuses=None):
     source = state.get("statuses", {}) if statuses is None else statuses
     statuses = {
@@ -357,13 +463,22 @@ async def update_table(channel, state, slots, statuses=None):
     new_message = await channel.send(
         embeds=embeds, allowed_mentions=discord.AllowedMentions.none()
     )
+    try:
+        await sync_signup_roles(channel, slots)
+    except (ValueError, discord.HTTPException):
+        try:
+            await new_message.delete()
+        except discord.HTTPException:
+            pass
+        raise
     if old_message is not None:
         try:
             await old_message.delete()
         except discord.NotFound:
             pass
         except discord.HTTPException:
-            # 古い枠を消せない場合は新規投稿を取り消し、元の参加情報を保つ。
+            # 古い枠を消せない場合はロールと新規投稿を戻す。
+            await sync_signup_roles(channel, state["slots"])
             try:
                 await new_message.delete()
             except discord.HTTPException:
@@ -465,6 +580,7 @@ async def now(interaction: discord.Interaction):
 async def reset_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
+        await sync_signup_roles(channel, {})
         # 削除処理の前に受付を停止する。空の枠を作り直さない。
         state["active"] = False
         state["slots"] = {}
@@ -622,6 +738,15 @@ async def apply_prefix_times(channel, command, numbers, user_id=None):
 
 
 async def handle_arc(message):
+    try:
+        await handle_signup_prefix(message)
+    except ValueError as error:
+        await message.reply(str(error), mention_author=False)
+    except discord.HTTPException:
+        await message.reply("❌ 募集を更新できませんでした。Botの権限を確認してください。", mention_author=False)
+
+
+async def handle_signup_prefix(message):
     parts = message.content.split()
     if not parts or parts[0] not in ("!arc", "!ard", "!ars", "!art", "!arnow", "!armcd", "!armc", "!arout"):
         return
@@ -703,7 +828,10 @@ async def table_command_error(interaction: discord.Interaction, error):
         print(error)
         return
     original = getattr(error, "original", error)
-    text = "❌ テーブルの更新に失敗しました。Botの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」「メッセージ履歴を読む」権限を確認してください。"
+    if isinstance(original, ValueError):
+        text = str(original)
+    else:
+        text = "❌ テーブルの更新に失敗しました。Botの「チャンネルを見る」「メッセージを送信」「埋め込みリンク」「メッセージ履歴を読む」権限を確認してください。"
     print(f"Table command failed: {original}")
     if interaction.response.is_done():
         await interaction.followup.send(text, ephemeral=True)
