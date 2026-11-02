@@ -227,15 +227,32 @@ def table_embed_list(slots):
     return embeds
 
 
+def is_signup_table(message):
+    return (
+        message.author.id == client.user.id
+        and any(e.title in ("6v6 War List", "6v6 War List（続き）")
+                and e.footer.text in (TABLE_FOOTER, "補欠: Substitute, 仮: Tentative")
+                for e in message.embeds)
+    )
+
+
+async def remove_extra_tables(channel, keep):
+    # このBot自身の募集枠だけを対象に、過去に残った重複枠も整理する。
+    async for message in channel.history(limit=100):
+        if message.id == keep.id or not is_signup_table(message):
+            continue
+        try:
+            await message.delete()
+        except discord.NotFound:
+            pass
+
+
 async def get_table_state(channel):
     if channel.id in table_states:
         return table_states[channel.id]
     state = {"message": None, "slots": {}}
-    # 再起動後は、直近100件にある自分のテーブルから参加情報を復元する。
     async for message in channel.history(limit=100):
-        if message.author.id != client.user.id or not message.embeds:
-            continue
-        if not any(e.footer.text == TABLE_FOOTER for e in message.embeds):
+        if not is_signup_table(message):
             continue
         state["message"] = message
         for embed in message.embeds:
@@ -243,8 +260,20 @@ async def get_table_state(channel):
                 number = int(field.name.split("@")[0])
                 state["slots"][number] = [int(x) for x in re.findall(r"<@!?(\d+)>", field.value)]
         break
+    if state["message"] is not None:
+        await remove_extra_tables(channel, state["message"])
     table_states[channel.id] = state
     return state
+
+
+async def create_table(channel):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        if state["message"] is not None:
+            await remove_extra_tables(channel, state["message"])
+            return "既に募集テーブルがあります。再表示は /now または !arnow を使ってください。"
+        await update_table(channel, state, {})
+        return "挙手テーブルを作成しました。"
 
 
 async def update_table(channel, state, slots):
@@ -268,17 +297,22 @@ async def update_table(channel, state, slots):
             raise
     state["message"] = new_message
     state["slots"] = slots
+    await remove_extra_tables(channel, new_message)
 
 
 async def repost_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
+        if state["message"] is None:
+            raise ValueError("募集テーブルがありません。先に /mc または !mc で作成してください。")
         await update_table(channel, state, state["slots"])
 
 
 async def join_table(channel, user_id, number):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
+        if state["message"] is None:
+            raise ValueError("募集テーブルがありません。先に /mc または !mc で作成してください。")
         slots = {key: list(users) for key, users in state["slots"].items()}
         users = slots.setdefault(number, [])
         if user_id in users:
@@ -296,24 +330,27 @@ async def join_table(channel, user_id, number):
 @app_commands.guild_only()
 async def mc(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    async with table_locks.setdefault(interaction.channel_id, asyncio.Lock()):
-        state = await get_table_state(interaction.channel)
-        await update_table(interaction.channel, state, state["slots"])
-    await interaction.followup.send("挙手テーブルを表示しました。", ephemeral=True)
+    result = await create_table(interaction.channel)
+    await interaction.followup.send(result, ephemeral=True)
 
 
 @tree.command(name="now", description="現在の募集状態を最新の位置に表示し直します")
 @app_commands.guild_only()
 async def now(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await repost_table(interaction.channel)
-    await interaction.followup.send("現在の募集状態を表示し直しました。", ephemeral=True)
+    try:
+        await repost_table(interaction.channel)
+        result = "現在の募集状態を表示し直しました。"
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
 
 
 async def reset_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
-        await update_table(channel, state, {})
+        if state["message"] is not None:
+            await update_table(channel, state, {})
 
 
 @tree.command(name="mcd", description="このチャンネルの募集内容をリセットします")
@@ -341,7 +378,15 @@ async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0,
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!arnow", "!armd"):
+    if not parts or parts[0] not in ("!arc", "!arnow", "!armd", "!mc"):
+        return
+    if parts[0] == "!mc":
+        if len(parts) != 1:
+            await message.reply("使い方：`!mc`", mention_author=False)
+            return
+        result = await create_table(message.channel)
+        if result.startswith("既に"):
+            await message.reply(result, mention_author=False)
         return
     if parts[0] == "!armd":
         if len(parts) != 1:
@@ -357,7 +402,10 @@ async def handle_arc(message):
         if len(parts) != 1:
             await message.reply("使い方：`!arnow`", mention_author=False)
             return
-        await repost_table(message.channel)
+        try:
+            await repost_table(message.channel)
+        except ValueError as error:
+            await message.reply(str(error), mention_author=False)
         return
     if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
         await message.reply("使い方：`!arc 数字`（0〜48の整数）", mention_author=False)
