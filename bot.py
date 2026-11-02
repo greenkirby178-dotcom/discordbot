@@ -249,14 +249,31 @@ async def get_table_state(channel):
 
 async def update_table(channel, state, slots):
     embeds = table_embed_list(slots)
-    if state["message"] is not None:
+    # 投稿に失敗しても既存の募集を失わないよう、新しい枠の送信後に古い枠を削除する。
+    old_message = state["message"]
+    new_message = await channel.send(
+        embeds=embeds, allowed_mentions=discord.AllowedMentions.none()
+    )
+    if old_message is not None:
         try:
-            await state["message"].edit(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+            await old_message.delete()
         except discord.NotFound:
-            state["message"] = None
-    if state["message"] is None:
-        state["message"] = await channel.send(embeds=embeds, allowed_mentions=discord.AllowedMentions.none())
+            pass
+        except discord.HTTPException:
+            # 古い枠を消せない場合は新規投稿を取り消し、元の参加情報を保つ。
+            try:
+                await new_message.delete()
+            except discord.HTTPException:
+                pass
+            raise
+    state["message"] = new_message
     state["slots"] = slots
+
+
+async def repost_table(channel):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        await update_table(channel, state, state["slots"])
 
 
 async def join_table(channel, user_id, number):
@@ -265,8 +282,10 @@ async def join_table(channel, user_id, number):
         slots = {key: list(users) for key, users in state["slots"].items()}
         users = slots.setdefault(number, [])
         if user_id in users:
+            await update_table(channel, state, state["slots"])
             return f"{number}の欄には既に挙手しています。"
         if len(users) >= 6:
+            await update_table(channel, state, state["slots"])
             return f"{number}の欄は定員6人に達しています。"
         users.append(user_id)
         await update_table(channel, state, slots)
@@ -281,6 +300,14 @@ async def mc(interaction: discord.Interaction):
         state = await get_table_state(interaction.channel)
         await update_table(interaction.channel, state, state["slots"])
     await interaction.followup.send("挙手テーブルを表示しました。", ephemeral=True)
+
+
+@tree.command(name="now", description="現在の募集状態を最新の位置に表示し直します")
+@app_commands.guild_only()
+async def now(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await repost_table(interaction.channel)
+    await interaction.followup.send("現在の募集状態を表示し直しました。", ephemeral=True)
 
 
 @tree.command(name="md", description="このチャンネルの挙手テーブルをリセットします")
@@ -307,21 +334,27 @@ async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0,
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] != "!arc":
+    if not parts or parts[0] not in ("!arc", "!arnow"):
+        return
+    if parts[0] == "!arnow":
+        if len(parts) != 1:
+            await message.reply("使い方：`!arnow`", mention_author=False)
+            return
+        await repost_table(message.channel)
         return
     if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
         await message.reply("使い方：`!arc 数字`（0〜48の整数）", mention_author=False)
         return
     try:
-        result = await join_table(message.channel, message.author.id, int(parts[1]))
+        # 更新された枠が返信を兼ねるため、成功後の確認メッセージは送らない。
+        await join_table(message.channel, message.author.id, int(parts[1]))
     except ValueError as error:
-        result = str(error)
-    await message.reply(result, mention_author=False)
+        await message.reply(str(error), mention_author=False)
 
 
 @tree.error
 async def table_command_error(interaction: discord.Interaction, error):
-    if interaction.command is None or interaction.command.name not in ("mc", "md", "c"):
+    if interaction.command is None or interaction.command.name not in ("mc", "md", "c", "now"):
         print(error)
         return
     original = getattr(error, "original", error)
