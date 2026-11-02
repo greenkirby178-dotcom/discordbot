@@ -187,5 +187,16 @@ async def chatmute_error(interaction: discord.Interaction, error):
     else:
         print(error)
 
-client.run(TOKEN)
+@tree.command(name="ms", description="野良模擬をやるかどうかを決めます")
+@app_commands.describe(n="1以上の整数（野良模擬をする確率は1/(n+1)）")
+async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
+    if n < 1:
+        await interaction.response.send_message(
+            "❌ nには1以上の整数を指定してください。", ephemeral=True
+        )
+        return
+    result = "野良模擬をする" if random.randrange(n + 1) == 0 else "野良模擬をしない"
+    await interaction.response.send_message(result)
 
+
+client.run(TOKEN)
