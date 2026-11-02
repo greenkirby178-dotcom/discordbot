@@ -516,16 +516,62 @@ async def out(interaction: discord.Interaction, number: app_commands.Range[int, 
     await interaction.followup.send(result, ephemeral=True)
 
 
+def parse_signup_times(text):
+    match = re.fullmatch(r"([0-9]+)(?:-([0-9]+))?", text)
+    if match is None:
+        raise ValueError("時間は0〜48の整数、または `21-23` の形で指定してください。")
+    start = int(match.group(1))
+    end = int(match.group(2)) if match.group(2) is not None else start
+    if not 0 <= start <= end <= 48:
+        raise ValueError("時間は0〜48で、開始≦終了になるよう指定してください。")
+    return list(range(start, end + 1))
+
+
+async def apply_prefix_times(channel, command, numbers, user_id=None):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        if not state["active"]:
+            raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        slots = {key: list(users) for key, users in state["slots"].items()}
+        statuses = {key: dict(labels) for key, labels in state.get("statuses", {}).items()}
+        for number in numbers:
+            if command == "!arout":
+                slots.pop(number, None)
+                statuses.pop(number, None)
+                continue
+            if command == "!ard":
+                users = slots.get(number, [])
+                if user_id in users:
+                    users.remove(user_id)
+                    statuses.get(number, {}).pop(user_id, None)
+                if not users:
+                    slots.pop(number, None)
+                    statuses.pop(number, None)
+                continue
+            status = {"!arc": "regular", "!ars": "substitute", "!art": "tentative"}[command]
+            users = slots.setdefault(number, [])
+            labels = statuses.setdefault(number, {})
+            regular_others = sum(labels.get(uid, "regular") == "regular" for uid in users if uid != user_id)
+            if status == "regular" and regular_others >= 6:
+                raise ValueError(f"{number}の欄は通常参加の定員6人です。今回の指定は変更していません。")
+            if user_id not in users:
+                users.append(user_id)
+            labels[user_id] = status
+        # 範囲全体を検証後に一度だけ再表示し、途中までの変更を防ぐ。
+        await update_table(channel, state, slots, statuses)
+
+
 async def handle_arc(message):
     parts = message.content.split()
     if not parts or parts[0] not in ("!arc", "!ard", "!ars", "!art", "!arnow", "!armcd", "!armc", "!arout"):
         return
     if parts[0] == "!arout":
-        if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
-            await message.reply("使い方：`!arout 数字`（0〜48の整数）", mention_author=False)
+        if len(parts) != 2:
+            await message.reply("使い方：`!arout 数字` または `!arout 開始-終了`", mention_author=False)
             return
         try:
-            await clear_table_slot(message.channel, int(parts[1]))
+            numbers = parse_signup_times(parts[1])
+            await apply_prefix_times(message.channel, "!arout", numbers)
         except ValueError as error:
             await message.reply(str(error), mention_author=False)
         return
@@ -557,8 +603,13 @@ async def handle_arc(message):
             await message.reply(str(error), mention_author=False)
         return
     command = parts[0]
-    if len(parts) not in (2, 3) or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
-        await message.reply(f"使い方：`{command} 数字 [@メンバー]`（0〜48の整数）", mention_author=False)
+    if len(parts) not in (2, 3):
+        await message.reply(f"使い方：`{command} 数字または開始-終了 [@メンバー]`", mention_author=False)
+        return
+    try:
+        numbers = parse_signup_times(parts[1])
+    except ValueError as error:
+        await message.reply(str(error), mention_author=False)
         return
     target = message.author
     if len(parts) == 3:
@@ -578,13 +629,7 @@ async def handle_arc(message):
                 await message.reply("メンバーを確認できませんでした。もう一度試してください。", mention_author=False)
                 return
     try:
-        if command == "!ard":
-            result = await leave_table(message.channel, target.id, int(parts[1]))
-        else:
-            status = {"!arc": "regular", "!ars": "substitute", "!art": "tentative"}[command]
-            result = await join_table(message.channel, target.id, int(parts[1]), status)
-        if result.startswith("⚠️"):
-            await message.reply(result, mention_author=False)
+        await apply_prefix_times(message.channel, command, numbers, target.id)
     except ValueError as error:
         await message.reply(str(error), mention_author=False)
 
