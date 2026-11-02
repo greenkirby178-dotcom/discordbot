@@ -250,11 +250,15 @@ async def remove_extra_tables(channel, keep):
 async def get_table_state(channel):
     if channel.id in table_states:
         return table_states[channel.id]
-    state = {"message": None, "slots": {}}
+    state = {"active": False, "message": None, "slots": {}}
     async for message in channel.history(limit=100):
+        if (message.author.id == client.user.id
+                and message.content.endswith("がこのチャンネルの募集テーブルを削除しました。")):
+            break
         if not is_signup_table(message):
             continue
         state["message"] = message
+        state["active"] = True
         for embed in message.embeds:
             for field in embed.fields:
                 number = int(field.name.split("@")[0])
@@ -269,10 +273,11 @@ async def get_table_state(channel):
 async def create_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
-        if state["message"] is not None:
+        if state["active"]:
             await remove_extra_tables(channel, state["message"])
             return "既に募集テーブルがあります。再表示は /now または !arnow を使ってください。"
         await update_table(channel, state, {})
+        state["active"] = True
         return "挙手テーブルを作成しました。"
 
 
@@ -303,16 +308,16 @@ async def update_table(channel, state, slots):
 async def repost_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
-        if state["message"] is None:
-            raise ValueError("募集テーブルがありません。先に /mc または !mc で作成してください。")
+        if not state["active"]:
+            raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
         await update_table(channel, state, state["slots"])
 
 
 async def join_table(channel, user_id, number):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
-        if state["message"] is None:
-            raise ValueError("募集テーブルがありません。先に /mc または !mc で作成してください。")
+        if not state["active"]:
+            raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
         slots = {key: list(users) for key, users in state["slots"].items()}
         users = slots.setdefault(number, [])
         if user_id in users:
@@ -349,17 +354,33 @@ async def now(interaction: discord.Interaction):
 async def reset_table(channel):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
-        if state["message"] is not None:
-            await update_table(channel, state, {})
+        # 削除処理の前に受付を停止する。空の枠を作り直さない。
+        state["active"] = False
+        state["slots"] = {}
+        tracked = state["message"]
+        if tracked is not None:
+            try:
+                await tracked.delete()
+            except discord.NotFound:
+                pass
+        state["message"] = None
+        # 過去に残った自分の募集枠も取り除く。
+        async for message in channel.history(limit=100):
+            if not is_signup_table(message):
+                continue
+            try:
+                await message.delete()
+            except discord.NotFound:
+                pass
 
 
-@tree.command(name="mcd", description="このチャンネルの募集内容をリセットします")
+@tree.command(name="mcd", description="このチャンネルの募集テーブルを削除し、挙手受付を終了します")
 @app_commands.guild_only()
 async def mcd(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=False)
     await reset_table(interaction.channel)
     await interaction.followup.send(
-        f"🗑️ {interaction.user.mention} がこのチャンネルの募集内容をリセットしました。",
+        f"🗑️ {interaction.user.mention} がこのチャンネルの募集テーブルを削除しました。",
         ephemeral=False, allowed_mentions=discord.AllowedMentions.none()
     )
 
@@ -378,23 +399,23 @@ async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0,
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!arnow", "!armd", "!mc"):
+    if not parts or parts[0] not in ("!arc", "!arnow", "!armcd", "!armc"):
         return
-    if parts[0] == "!mc":
+    if parts[0] == "!armc":
         if len(parts) != 1:
-            await message.reply("使い方：`!mc`", mention_author=False)
+            await message.reply("使い方：`!armc`", mention_author=False)
             return
         result = await create_table(message.channel)
         if result.startswith("既に"):
             await message.reply(result, mention_author=False)
         return
-    if parts[0] == "!armd":
+    if parts[0] == "!armcd":
         if len(parts) != 1:
-            await message.reply("使い方：`!armd`", mention_author=False)
+            await message.reply("使い方：`!armcd`", mention_author=False)
             return
         await reset_table(message.channel)
         await message.reply(
-            f"🗑️ {message.author.mention} がこのチャンネルの募集内容をリセットしました。",
+            f"🗑️ {message.author.mention} がこのチャンネルの募集テーブルを削除しました。",
             mention_author=False, allowed_mentions=discord.AllowedMentions.none()
         )
         return
