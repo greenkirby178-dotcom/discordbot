@@ -206,6 +206,14 @@ async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
 
 TABLE_FOOTER = "補欠: Substitute, 仮: Tentative | AR挙手テーブル"
 VALID_CAPACITIES = (2, 3, 4, 6, 8, 12)
+CAPACITY_COLOURS = {
+    2: 0xE74C3C,   # 赤
+    3: 0xE67E22,   # オレンジ
+    4: 0xF1C40F,   # 黄色
+    6: 0x2ECC71,   # 緑
+    8: 0x3498DB,   # 青
+    12: 0x9B59B6,  # 紫
+}
 table_states = {}
 table_locks = {}
 
@@ -213,11 +221,11 @@ table_locks = {}
 def table_embed_list(slots, statuses=None, capacity=6):
     statuses = statuses or {}
     embeds = []
-    embed = discord.Embed(title=f"{capacity}v{capacity} War List", colour=discord.Colour(0xF1E05A))
+    embed = discord.Embed(title=f"{capacity}v{capacity} War List", colour=discord.Colour(CAPACITY_COLOURS[capacity]))
     for number, users in sorted(slots.items()):
         if len(embed.fields) == 25:
             embeds.append(embed)
-            embed = discord.Embed(title=f"{capacity}v{capacity} War List（続き）", colour=discord.Colour(0xF1E05A))
+            embed = discord.Embed(title=f"{capacity}v{capacity} War List（続き）", colour=discord.Colour(CAPACITY_COLOURS[capacity]))
         labels = statuses.get(number, {})
         regular_count = sum(labels.get(uid, "regular") == "regular" for uid in users)
         extra_count = len(users) - regular_count
@@ -300,8 +308,20 @@ async def create_table(channel, capacity=6):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
         if state["active"]:
+            current_capacity = state.get("capacity", 6)
+            if capacity != current_capacity and not any(state["slots"].values()):
+                state["capacity"] = capacity
+                try:
+                    await update_table(channel, state, {})
+                except Exception:
+                    state["capacity"] = current_capacity
+                    raise
+                return f"募集形式を{capacity}v{capacity}に変更しました。"
             await remove_extra_tables(channel, state["message"])
-            return "既に募集テーブルがあります。再表示は /now または !arnow を使ってください。"
+            if capacity != current_capacity:
+                return (f"既に{current_capacity}v{current_capacity}で募集中です。参加者がいるため形式を変更できません。"
+                        f" /mcd または !armcd で削除してから、!armc {capacity} または /mc で作成してください。")
+            return f"既に{current_capacity}v{current_capacity}の募集テーブルがあります。再表示は /now または !arnow を使ってください。"
         previous_capacity = state.get("capacity", 6)
         state["capacity"] = capacity
         try:
