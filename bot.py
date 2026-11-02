@@ -199,4 +199,15 @@ async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
     await interaction.response.send_message(result)
 
 
+@tree.command(name="mc", description="挙手テーブルの枠を表示します（実験版）")
+async def mc(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="6v6 War List",
+        description="挙手テーブル（実験版）",
+        colour=discord.Colour(0xF1E05A),
+    )
+    embed.set_footer(text="補欠: Substitute, 仮: Tentative")
+    await interaction.response.send_message(embed=embed)
+
+
 client.run(TOKEN)
