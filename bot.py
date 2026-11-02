@@ -428,9 +428,43 @@ async def d(interaction: discord.Interaction, number: app_commands.Range[int, 0,
     await interaction.followup.send(result, ephemeral=True)
 
 
+async def clear_table_slot(channel, number):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        if not state["active"]:
+            raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        slots = {key: list(users) for key, users in state["slots"].items()}
+        removed = slots.pop(number, [])
+        await update_table(channel, state, slots)
+        if not removed:
+            return f"{number}の欄には参加者がいません。"
+        return f"{number}の欄の参加者{len(removed)}人を募集テーブルから削除しました。"
+
+
+@tree.command(name="out", description="指定した数字の欄の参加者全員を募集テーブルから削除します")
+@app_commands.guild_only()
+@app_commands.describe(number="削除する欄の数字（0〜48）")
+async def out(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48]):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        result = await clear_table_slot(interaction.channel, number)
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
+
+
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!ard", "!arnow", "!armcd", "!armc"):
+    if not parts or parts[0] not in ("!arc", "!ard", "!arnow", "!armcd", "!armc", "!arout"):
+        return
+    if parts[0] == "!arout":
+        if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
+            await message.reply("使い方：`!arout 数字`（0〜48の整数）", mention_author=False)
+            return
+        try:
+            await clear_table_slot(message.channel, int(parts[1]))
+        except ValueError as error:
+            await message.reply(str(error), mention_author=False)
         return
     if parts[0] == "!armc":
         if len(parts) != 1:
@@ -491,7 +525,7 @@ async def handle_arc(message):
 
 @tree.error
 async def table_command_error(interaction: discord.Interaction, error):
-    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "d", "now"):
+    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "d", "now", "out"):
         print(error)
         return
     original = getattr(error, "original", error)
