@@ -205,22 +205,23 @@ async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
 
 
 TABLE_FOOTER = "補欠: Substitute, 仮: Tentative | AR挙手テーブル"
+VALID_CAPACITIES = (2, 3, 4, 6, 8, 12)
 table_states = {}
 table_locks = {}
 
 
-def table_embed_list(slots, statuses=None):
+def table_embed_list(slots, statuses=None, capacity=6):
     statuses = statuses or {}
     embeds = []
-    embed = discord.Embed(title="6v6 War List", colour=discord.Colour(0xF1E05A))
+    embed = discord.Embed(title=f"{capacity}v{capacity} War List", colour=discord.Colour(0xF1E05A))
     for number, users in sorted(slots.items()):
         if len(embed.fields) == 25:
             embeds.append(embed)
-            embed = discord.Embed(title="6v6 War List（続き）", colour=discord.Colour(0xF1E05A))
+            embed = discord.Embed(title=f"{capacity}v{capacity} War List（続き）", colour=discord.Colour(0xF1E05A))
         labels = statuses.get(number, {})
         regular_count = sum(labels.get(uid, "regular") == "regular" for uid in users)
         extra_count = len(users) - regular_count
-        heading = f"{number}@{max(0, 6 - regular_count)}"
+        heading = f"{number}@{max(0, capacity - regular_count)}"
         if extra_count:
             heading += f" ({extra_count})"
         lines = []
@@ -248,7 +249,7 @@ def table_embed_list(slots, statuses=None):
 def is_signup_table(message):
     return (
         message.author.id == client.user.id
-        and any(e.title in ("6v6 War List", "6v6 War List（続き）")
+        and any(re.fullmatch(r"(2v2|3v3|4v4|6v6|8v8|12v12) War List(?:（続き）)?", e.title or "")
                 and e.footer.text in (TABLE_FOOTER, "補欠: Substitute, 仮: Tentative")
                 for e in message.embeds)
     )
@@ -268,7 +269,7 @@ async def remove_extra_tables(channel, keep):
 async def get_table_state(channel):
     if channel.id in table_states:
         return table_states[channel.id]
-    state = {"active": False, "message": None, "slots": {}, "statuses": {}}
+    state = {"active": False, "message": None, "slots": {}, "statuses": {}, "capacity": 6}
     async for message in channel.history(limit=100):
         if (message.author.id == client.user.id
                 and message.content.endswith("がこのチャンネルの募集テーブルを削除しました。")):
@@ -277,6 +278,7 @@ async def get_table_state(channel):
             continue
         state["message"] = message
         state["active"] = True
+        state["capacity"] = int(re.match(r"(\d+)v", message.embeds[0].title).group(1))
         for embed in message.embeds:
             for field in embed.fields:
                 number = int(field.name.split("@")[0])
@@ -292,15 +294,28 @@ async def get_table_state(channel):
     return state
 
 
-async def create_table(channel):
+async def create_table(channel, capacity=6):
+    if capacity not in VALID_CAPACITIES:
+        raise ValueError("募集人数は2・3・4・6・8・12から選んでください。")
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
         if state["active"]:
             await remove_extra_tables(channel, state["message"])
             return "既に募集テーブルがあります。再表示は /now または !arnow を使ってください。"
-        await update_table(channel, state, {})
+        previous_capacity = state.get("capacity", 6)
+        state["capacity"] = capacity
+        try:
+            await update_table(channel, state, {})
+        except Exception:
+            state["capacity"] = previous_capacity
+            raise
         state["active"] = True
-        return "挙手テーブルを作成しました。"
+        return f"{capacity}v{capacity}の挙手テーブルを作成しました。"
+
+
+def regular_users(slots, statuses, number):
+    return [uid for uid in slots.get(number, [])
+            if statuses.get(number, {}).get(uid, "regular") == "regular"]
 
 
 async def update_table(channel, state, slots, statuses=None):
@@ -309,7 +324,14 @@ async def update_table(channel, state, slots, statuses=None):
         number: {uid: source.get(number, {}).get(uid, "regular") for uid in users}
         for number, users in slots.items()
     }
-    embeds = table_embed_list(slots, statuses)
+    capacity = state.get("capacity", 6)
+    completions = []
+    for number in sorted(slots):
+        previous = regular_users(state["slots"], state.get("statuses", {}), number)
+        current = regular_users(slots, statuses, number)
+        if len(previous) < capacity and len(current) == capacity:
+            completions.append((number, current))
+    embeds = table_embed_list(slots, statuses, capacity)
     # 投稿に失敗しても既存の募集を失わないよう、新しい枠の送信後に古い枠を削除する。
     old_message = state["message"]
     new_message = await channel.send(
@@ -331,6 +353,18 @@ async def update_table(channel, state, slots, statuses=None):
     state["slots"] = slots
     state["statuses"] = statuses
     await remove_extra_tables(channel, new_message)
+    for number, users in completions:
+        mentions = "、".join(f"<@{uid}>" for uid in users)
+        try:
+            await channel.send(
+                f"{number}にて揃いました！{mentions}",
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False, roles=False,
+                    users=[discord.Object(id=uid) for uid in users], replied_user=False
+                ),
+            )
+        except discord.HTTPException as error:
+            print(f"募集成立通知の送信に失敗しました: {error}")
 
 
 async def repost_table(channel):
@@ -346,6 +380,7 @@ async def join_table(channel, user_id, number, status="regular"):
         state = await get_table_state(channel)
         if not state["active"]:
             raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        capacity = state.get("capacity", 6)
         slots = {key: list(users) for key, users in state["slots"].items()}
         statuses = {key: dict(labels) for key, labels in state.get("statuses", {}).items()}
         users = slots.setdefault(number, [])
@@ -354,16 +389,16 @@ async def join_table(channel, user_id, number, status="regular"):
             await update_table(channel, state, state["slots"])
             return f"{number}の欄には既に同じ区分で登録されています。"
         regular_others = sum(labels.get(uid, "regular") == "regular" for uid in users if uid != user_id)
-        if status == "regular" and regular_others >= 6:
+        if status == "regular" and regular_others >= capacity:
             await update_table(channel, state, state["slots"])
-            return f"{number}の欄は通常参加の定員6人に達しています。"
+            return f"{number}の欄は通常参加の定員{capacity}人に達しています。"
         if user_id not in users:
             users.append(user_id)
         labels[user_id] = status
         await update_table(channel, state, slots, statuses)
         regular_count = sum(labels.get(uid, "regular") == "regular" for uid in users)
         label = {"regular": "通常参加", "substitute": "補欠", "tentative": "仮"}[status]
-        return f"{number}の欄に{label}で登録しました。残り{6 - regular_count}人です。"
+        return f"{number}の欄に{label}で登録しました。残り{capacity - regular_count}人です。"
 
 
 async def leave_table(channel, user_id, number):
@@ -371,6 +406,7 @@ async def leave_table(channel, user_id, number):
         state = await get_table_state(channel)
         if not state["active"]:
             raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        capacity = state.get("capacity", 6)
         slots = {key: list(users) for key, users in state["slots"].items()}
         users = slots.get(number, [])
         if user_id not in users:
@@ -381,14 +417,16 @@ async def leave_table(channel, user_id, number):
             del slots[number]
         await update_table(channel, state, slots)
         regular_count = sum(state.get("statuses", {}).get(number, {}).get(uid, "regular") == "regular" for uid in users)
-        return f"{number}の欄から挙手を取り消しました。残り{6 - regular_count}人です。"
+        return f"{number}の欄から挙手を取り消しました。残り{capacity - regular_count}人です。"
 
 
 @tree.command(name="mc", description="挙手テーブルを表示します")
 @app_commands.guild_only()
-async def mc(interaction: discord.Interaction):
+@app_commands.describe(mode="募集形式（省略時は6v6）")
+@app_commands.choices(mode=[app_commands.Choice(name=f"{n}v{n}", value=n) for n in VALID_CAPACITIES])
+async def mc(interaction: discord.Interaction, mode: int = 6):
     await interaction.response.defer(ephemeral=True)
-    result = await create_table(interaction.channel)
+    result = await create_table(interaction.channel, mode)
     await interaction.followup.send(result, ephemeral=True)
 
 
@@ -496,6 +534,7 @@ async def clear_table_slot(channel, number):
         state = await get_table_state(channel)
         if not state["active"]:
             raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        capacity = state.get("capacity", 6)
         slots = {key: list(users) for key, users in state["slots"].items()}
         removed = slots.pop(number, [])
         await update_table(channel, state, slots)
@@ -532,6 +571,7 @@ async def apply_prefix_times(channel, command, numbers, user_id=None):
         state = await get_table_state(channel)
         if not state["active"]:
             raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        capacity = state.get("capacity", 6)
         slots = {key: list(users) for key, users in state["slots"].items()}
         statuses = {key: dict(labels) for key, labels in state.get("statuses", {}).items()}
         for number in numbers:
@@ -552,8 +592,8 @@ async def apply_prefix_times(channel, command, numbers, user_id=None):
             users = slots.setdefault(number, [])
             labels = statuses.setdefault(number, {})
             regular_others = sum(labels.get(uid, "regular") == "regular" for uid in users if uid != user_id)
-            if status == "regular" and regular_others >= 6:
-                raise ValueError(f"{number}の欄は通常参加の定員6人です。今回の指定は変更していません。")
+            if status == "regular" and regular_others >= capacity:
+                raise ValueError(f"{number}の欄は通常参加の定員{capacity}人です。今回の指定は変更していません。")
             if user_id not in users:
                 users.append(user_id)
             labels[user_id] = status
@@ -576,10 +616,13 @@ async def handle_arc(message):
             await message.reply(str(error), mention_author=False)
         return
     if parts[0] == "!armc":
-        if len(parts) != 1:
-            await message.reply("使い方：`!armc`", mention_author=False)
+        if (len(parts) not in (1, 2)
+                or (len(parts) == 2 and (not re.fullmatch(r"[0-9]+", parts[1])
+                                        or int(parts[1]) not in VALID_CAPACITIES))):
+            await message.reply("使い方：`!armc [2 / 3 / 4 / 6 / 8 / 12]`（省略時は6v6）", mention_author=False)
             return
-        result = await create_table(message.channel)
+        capacity = int(parts[1]) if len(parts) == 2 else 6
+        result = await create_table(message.channel, capacity)
         if result.startswith("既に"):
             await message.reply(result, mention_author=False)
         return
