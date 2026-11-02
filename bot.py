@@ -207,12 +207,12 @@ async def ms(interaction: discord.Interaction, n: app_commands.Range[int, 1]):
 TABLE_FOOTER = "補欠: Substitute, 仮: Tentative | AR挙手テーブル"
 VALID_CAPACITIES = (2, 3, 4, 6, 8, 12)
 CAPACITY_COLOURS = {
-    2: 0xE74C3C,   # 赤
-    3: 0xE67E22,   # オレンジ
-    4: 0xF1C40F,   # 黄色
-    6: 0x2ECC71,   # 緑
-    8: 0x3498DB,   # 青
-    12: 0x9B59B6,  # 紫
+    2: 0xFF0000,   # 赤
+    3: 0xFF8000,   # オレンジ
+    4: 0xFFFF00,   # 黄色
+    6: 0x00FF00,   # 緑
+    8: 0x0080FF,   # 青
+    12: 0xA000FF,  # 紫
 }
 table_states = {}
 table_locks = {}
