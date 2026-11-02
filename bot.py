@@ -331,6 +331,23 @@ async def join_table(channel, user_id, number):
         return f"{number}の欄に挙手しました。残り{6 - len(users)}人です。"
 
 
+async def leave_table(channel, user_id, number):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        if not state["active"]:
+            raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
+        slots = {key: list(users) for key, users in state["slots"].items()}
+        users = slots.get(number, [])
+        if user_id not in users:
+            await update_table(channel, state, state["slots"])
+            return "⚠️ 指定したメンバーはその欄に挙手していません。"
+        users.remove(user_id)
+        if not users:
+            del slots[number]
+        await update_table(channel, state, slots)
+        return f"{number}の欄から挙手を取り消しました。残り{6 - len(users)}人です。"
+
+
 @tree.command(name="mc", description="挙手テーブルを表示します")
 @app_commands.guild_only()
 async def mc(interaction: discord.Interaction):
@@ -387,11 +404,25 @@ async def mcd(interaction: discord.Interaction):
 
 @tree.command(name="c", description="指定した数字の欄に挙手します")
 @app_commands.guild_only()
-@app_commands.describe(number="挙手する欄の数字（0〜48）")
-async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48]):
+@app_commands.describe(number="挙手する欄の数字（0〜48）", member="登録するメンバー（省略すると自分）")
+async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48], member: discord.Member | None = None):
     await interaction.response.defer(ephemeral=True)
     try:
-        result = await join_table(interaction.channel, interaction.user.id, number)
+        target = member if member is not None else interaction.user
+        result = await join_table(interaction.channel, target.id, number)
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@tree.command(name="d", description="指定した数字の欄から挙手を取り消します")
+@app_commands.guild_only()
+@app_commands.describe(number="取り消す欄の数字（0〜48）", member="取り消すメンバー（省略すると自分）")
+async def d(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48], member: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = member if member is not None else interaction.user
+        result = await leave_table(interaction.channel, target.id, number)
     except ValueError as error:
         result = str(error)
     await interaction.followup.send(result, ephemeral=True)
@@ -399,7 +430,7 @@ async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0,
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!arnow", "!armcd", "!armc"):
+    if not parts or parts[0] not in ("!arc", "!ard", "!arnow", "!armcd", "!armc"):
         return
     if parts[0] == "!armc":
         if len(parts) != 1:
@@ -428,19 +459,39 @@ async def handle_arc(message):
         except ValueError as error:
             await message.reply(str(error), mention_author=False)
         return
-    if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
-        await message.reply("使い方：`!arc 数字`（0〜48の整数）", mention_author=False)
+    command = parts[0]
+    if len(parts) not in (2, 3) or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
+        await message.reply(f"使い方：`{command} 数字 [@メンバー]`（0〜48の整数）", mention_author=False)
         return
+    target = message.author
+    if len(parts) == 3:
+        match = re.fullmatch(r"<@!?(\d+)>", parts[2])
+        if match is None:
+            await message.reply("対象はサーバーのメンバー1人をメンションしてください。", mention_author=False)
+            return
+        target_id = int(match.group(1))
+        target = message.guild.get_member(target_id)
+        if target is None:
+            try:
+                target = await message.guild.fetch_member(target_id)
+            except discord.NotFound:
+                await message.reply("そのメンバーはこのサーバーにいません。", mention_author=False)
+                return
+            except discord.HTTPException:
+                await message.reply("メンバーを確認できませんでした。もう一度試してください。", mention_author=False)
+                return
     try:
-        # 更新された枠が返信を兼ねるため、成功後の確認メッセージは送らない。
-        await join_table(message.channel, message.author.id, int(parts[1]))
+        action = join_table if command == "!arc" else leave_table
+        result = await action(message.channel, target.id, int(parts[1]))
+        if result.startswith("⚠️"):
+            await message.reply(result, mention_author=False)
     except ValueError as error:
         await message.reply(str(error), mention_author=False)
 
 
 @tree.error
 async def table_command_error(interaction: discord.Interaction, error):
-    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "now"):
+    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "d", "now"):
         print(error)
         return
     original = getattr(error, "original", error)
