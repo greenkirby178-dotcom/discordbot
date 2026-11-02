@@ -209,15 +209,33 @@ table_states = {}
 table_locks = {}
 
 
-def table_embed_list(slots):
+def table_embed_list(slots, statuses=None):
+    statuses = statuses or {}
     embeds = []
     embed = discord.Embed(title="6v6 War List", colour=discord.Colour(0xF1E05A))
     for number, users in sorted(slots.items()):
         if len(embed.fields) == 25:
             embeds.append(embed)
             embed = discord.Embed(title="6v6 War List（続き）", colour=discord.Colour(0xF1E05A))
-        embed.add_field(name=f"{number}@{max(0, 6 - len(users))}",
-                        value="\n".join(f"> <@{uid}>" for uid in users) or "参加者なし", inline=False)
+        labels = statuses.get(number, {})
+        regular_count = sum(labels.get(uid, "regular") == "regular" for uid in users)
+        extra_count = len(users) - regular_count
+        heading = f"{number}@{max(0, 6 - regular_count)}"
+        if extra_count:
+            heading += f" ({extra_count})"
+        lines = []
+        for uid in users:
+            status = labels.get(uid, "regular")
+            if status == "substitute":
+                lines.append(f"> (補<@{uid}>)")
+            elif status == "tentative":
+                lines.append(f"> (仮<@{uid}>)")
+            else:
+                lines.append(f"> <@{uid}>")
+        value = "\n".join(lines) or "参加者なし"
+        if len(value) > 1024:
+            raise ValueError("この時間の欄は表示上限に達しています。")
+        embed.add_field(name=heading, value=value, inline=False)
     if not slots:
         embed.description = "まだ挙手はありません。`/c 数字` または `!arc 数字` で参加できます。"
     embed.set_footer(text=TABLE_FOOTER)
@@ -250,7 +268,7 @@ async def remove_extra_tables(channel, keep):
 async def get_table_state(channel):
     if channel.id in table_states:
         return table_states[channel.id]
-    state = {"active": False, "message": None, "slots": {}}
+    state = {"active": False, "message": None, "slots": {}, "statuses": {}}
     async for message in channel.history(limit=100):
         if (message.author.id == client.user.id
                 and message.content.endswith("がこのチャンネルの募集テーブルを削除しました。")):
@@ -263,6 +281,10 @@ async def get_table_state(channel):
             for field in embed.fields:
                 number = int(field.name.split("@")[0])
                 state["slots"][number] = [int(x) for x in re.findall(r"<@!?(\d+)>", field.value)]
+                state["statuses"][number] = {
+                    int(uid): {"補": "substitute", "仮": "tentative"}.get(mark, "regular")
+                    for mark, uid in re.findall(r"(補|仮)?<@!?(\d+)>", field.value)
+                }
         break
     if state["message"] is not None:
         await remove_extra_tables(channel, state["message"])
@@ -281,8 +303,13 @@ async def create_table(channel):
         return "挙手テーブルを作成しました。"
 
 
-async def update_table(channel, state, slots):
-    embeds = table_embed_list(slots)
+async def update_table(channel, state, slots, statuses=None):
+    source = state.get("statuses", {}) if statuses is None else statuses
+    statuses = {
+        number: {uid: source.get(number, {}).get(uid, "regular") for uid in users}
+        for number, users in slots.items()
+    }
+    embeds = table_embed_list(slots, statuses)
     # 投稿に失敗しても既存の募集を失わないよう、新しい枠の送信後に古い枠を削除する。
     old_message = state["message"]
     new_message = await channel.send(
@@ -302,6 +329,7 @@ async def update_table(channel, state, slots):
             raise
     state["message"] = new_message
     state["slots"] = slots
+    state["statuses"] = statuses
     await remove_extra_tables(channel, new_message)
 
 
@@ -313,22 +341,29 @@ async def repost_table(channel):
         await update_table(channel, state, state["slots"])
 
 
-async def join_table(channel, user_id, number):
+async def join_table(channel, user_id, number, status="regular"):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
         if not state["active"]:
             raise ValueError("募集テーブルがありません。先に /mc または !armc で作成してください。")
         slots = {key: list(users) for key, users in state["slots"].items()}
+        statuses = {key: dict(labels) for key, labels in state.get("statuses", {}).items()}
         users = slots.setdefault(number, [])
-        if user_id in users:
+        labels = statuses.setdefault(number, {})
+        if user_id in users and labels.get(user_id, "regular") == status:
             await update_table(channel, state, state["slots"])
-            return f"{number}の欄には既に挙手しています。"
-        if len(users) >= 6:
+            return f"{number}の欄には既に同じ区分で登録されています。"
+        regular_others = sum(labels.get(uid, "regular") == "regular" for uid in users if uid != user_id)
+        if status == "regular" and regular_others >= 6:
             await update_table(channel, state, state["slots"])
-            return f"{number}の欄は定員6人に達しています。"
-        users.append(user_id)
-        await update_table(channel, state, slots)
-        return f"{number}の欄に挙手しました。残り{6 - len(users)}人です。"
+            return f"{number}の欄は通常参加の定員6人に達しています。"
+        if user_id not in users:
+            users.append(user_id)
+        labels[user_id] = status
+        await update_table(channel, state, slots, statuses)
+        regular_count = sum(labels.get(uid, "regular") == "regular" for uid in users)
+        label = {"regular": "通常参加", "substitute": "補欠", "tentative": "仮"}[status]
+        return f"{number}の欄に{label}で登録しました。残り{6 - regular_count}人です。"
 
 
 async def leave_table(channel, user_id, number):
@@ -345,7 +380,8 @@ async def leave_table(channel, user_id, number):
         if not users:
             del slots[number]
         await update_table(channel, state, slots)
-        return f"{number}の欄から挙手を取り消しました。残り{6 - len(users)}人です。"
+        regular_count = sum(state.get("statuses", {}).get(number, {}).get(uid, "regular") == "regular" for uid in users)
+        return f"{number}の欄から挙手を取り消しました。残り{6 - regular_count}人です。"
 
 
 @tree.command(name="mc", description="挙手テーブルを表示します")
@@ -374,6 +410,7 @@ async def reset_table(channel):
         # 削除処理の前に受付を停止する。空の枠を作り直さない。
         state["active"] = False
         state["slots"] = {}
+        state["statuses"] = {}
         tracked = state["message"]
         if tracked is not None:
             try:
@@ -428,6 +465,32 @@ async def d(interaction: discord.Interaction, number: app_commands.Range[int, 0,
     await interaction.followup.send(result, ephemeral=True)
 
 
+@tree.command(name="s", description="指定した数字の欄に補欠で登録します")
+@app_commands.guild_only()
+@app_commands.describe(number="登録する欄の数字（0〜48）", member="登録するメンバー（省略すると自分）")
+async def s(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48], member: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = member if member is not None else interaction.user
+        result = await join_table(interaction.channel, target.id, number, "substitute")
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
+
+
+@tree.command(name="t", description="指定した数字の欄に仮で登録します")
+@app_commands.guild_only()
+@app_commands.describe(number="登録する欄の数字（0〜48）", member="登録するメンバー（省略すると自分）")
+async def t(interaction: discord.Interaction, number: app_commands.Range[int, 0, 48], member: discord.Member | None = None):
+    await interaction.response.defer(ephemeral=True)
+    try:
+        target = member if member is not None else interaction.user
+        result = await join_table(interaction.channel, target.id, number, "tentative")
+    except ValueError as error:
+        result = str(error)
+    await interaction.followup.send(result, ephemeral=True)
+
+
 async def clear_table_slot(channel, number):
     async with table_locks.setdefault(channel.id, asyncio.Lock()):
         state = await get_table_state(channel)
@@ -455,7 +518,7 @@ async def out(interaction: discord.Interaction, number: app_commands.Range[int, 
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!ard", "!arnow", "!armcd", "!armc", "!arout"):
+    if not parts or parts[0] not in ("!arc", "!ard", "!ars", "!art", "!arnow", "!armcd", "!armc", "!arout"):
         return
     if parts[0] == "!arout":
         if len(parts) != 2 or not re.fullmatch(r"[0-9]+", parts[1]) or not 0 <= int(parts[1]) <= 48:
@@ -515,8 +578,11 @@ async def handle_arc(message):
                 await message.reply("メンバーを確認できませんでした。もう一度試してください。", mention_author=False)
                 return
     try:
-        action = join_table if command == "!arc" else leave_table
-        result = await action(message.channel, target.id, int(parts[1]))
+        if command == "!ard":
+            result = await leave_table(message.channel, target.id, int(parts[1]))
+        else:
+            status = {"!arc": "regular", "!ars": "substitute", "!art": "tentative"}[command]
+            result = await join_table(message.channel, target.id, int(parts[1]), status)
         if result.startswith("⚠️"):
             await message.reply(result, mention_author=False)
     except ValueError as error:
@@ -525,7 +591,7 @@ async def handle_arc(message):
 
 @tree.error
 async def table_command_error(interaction: discord.Interaction, error):
-    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "d", "now", "out"):
+    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "d", "s", "t", "now", "out"):
         print(error)
         return
     original = getattr(error, "original", error)
