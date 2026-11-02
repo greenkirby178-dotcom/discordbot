@@ -223,7 +223,7 @@ def table_embed_list(slots):
     embed.set_footer(text=TABLE_FOOTER)
     embeds.append(embed)
     if sum(len(e) for e in embeds) > 5900:
-        raise ValueError("テーブルが表示上限に達しました。/md でリセットしてください。")
+        raise ValueError("テーブルが表示上限に達しました。/mcd でリセットしてください。")
     return embeds
 
 
@@ -310,14 +310,21 @@ async def now(interaction: discord.Interaction):
     await interaction.followup.send("現在の募集状態を表示し直しました。", ephemeral=True)
 
 
-@tree.command(name="md", description="このチャンネルの挙手テーブルをリセットします")
+async def reset_table(channel):
+    async with table_locks.setdefault(channel.id, asyncio.Lock()):
+        state = await get_table_state(channel)
+        await update_table(channel, state, {})
+
+
+@tree.command(name="mcd", description="このチャンネルの募集内容をリセットします")
 @app_commands.guild_only()
-async def md(interaction: discord.Interaction):
-    await interaction.response.defer(ephemeral=True)
-    async with table_locks.setdefault(interaction.channel_id, asyncio.Lock()):
-        state = await get_table_state(interaction.channel)
-        await update_table(interaction.channel, state, {})
-    await interaction.followup.send("挙手テーブルをリセットしました。", ephemeral=True)
+async def mcd(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=False)
+    await reset_table(interaction.channel)
+    await interaction.followup.send(
+        f"🗑️ {interaction.user.mention} がこのチャンネルの募集内容をリセットしました。",
+        ephemeral=False, allowed_mentions=discord.AllowedMentions.none()
+    )
 
 
 @tree.command(name="c", description="指定した数字の欄に挙手します")
@@ -334,7 +341,17 @@ async def c(interaction: discord.Interaction, number: app_commands.Range[int, 0,
 
 async def handle_arc(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ("!arc", "!arnow"):
+    if not parts or parts[0] not in ("!arc", "!arnow", "!armd"):
+        return
+    if parts[0] == "!armd":
+        if len(parts) != 1:
+            await message.reply("使い方：`!armd`", mention_author=False)
+            return
+        await reset_table(message.channel)
+        await message.reply(
+            f"🗑️ {message.author.mention} がこのチャンネルの募集内容をリセットしました。",
+            mention_author=False, allowed_mentions=discord.AllowedMentions.none()
+        )
         return
     if parts[0] == "!arnow":
         if len(parts) != 1:
@@ -354,7 +371,7 @@ async def handle_arc(message):
 
 @tree.error
 async def table_command_error(interaction: discord.Interaction, error):
-    if interaction.command is None or interaction.command.name not in ("mc", "md", "c", "now"):
+    if interaction.command is None or interaction.command.name not in ("mc", "mcd", "c", "now"):
         print(error)
         return
     original = getattr(error, "original", error)
