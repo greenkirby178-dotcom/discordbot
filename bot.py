@@ -860,4 +860,21 @@ async def cej(interaction: discord.Interaction, course: str):
 async def cje(interaction: discord.Interaction, course: str):
     await interaction.response.send_message(TO_CODE.get(course_key(course), "該当するコース名がありません。"))
 
+
+def course_suggestions(values, current):
+    query = course_key(current)
+    matches = [value for value in values if query in course_key(value)]
+    matches.sort(key=lambda value: not course_key(value).startswith(query))
+    return [app_commands.Choice(name=value, value=value) for value in matches[:25]]
+
+
+@cej.autocomplete("course")
+async def suggest_course_code(interaction: discord.Interaction, current: str):
+    return course_suggestions(COURSE_CODES, current)
+
+
+@cje.autocomplete("course")
+async def suggest_course_name(interaction: discord.Interaction, current: str):
+    return course_suggestions(COURSE_CODES.values(), current)
+
 client.run(TOKEN)
