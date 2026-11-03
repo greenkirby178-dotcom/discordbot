@@ -840,4 +840,24 @@ async def table_command_error(interaction: discord.Interaction, error):
 
 
 
+import unicodedata
+
+COURSE_CODES = {'MBC': 'マリオブラザーズサーキット', 'CC': 'トロフィーシティ', 'WS': 'シュポポコースター', 'DKS': 'DKうちゅうセンター', 'DD': 'サンサンさばく', 'SGB': 'ヘイホーカーニバル', 'WSr': 'ワリオスタジアム', 'AF': 'キラーシップ', 'DKP': 'DKスノーマウンテン', 'SP': 'ロゼッタてんもんだい', 'SHr': 'アイスビルディング', 'WSs': 'ワリオシップ', 'KTB': 'ノコノコビーチ', 'FO': 'リバーサイドサファリ', 'PS': 'ピーチスタジアム', 'PB': 'ピーチビーチ', 'SSS': 'ソルティータウン', 'DDJ': 'ディノディノジャングル', 'GBR': 'ハテナしんでん', 'CCF': 'プクプクフォールズ', 'DDD': 'ショーニューロード', 'BCi': 'おばけシネマ', 'FH': 'ホネホネツイスター', 'MMM': 'モーモーカントリー', 'CM': 'チョコマウンテン', 'TF': 'キノピオファクトリー', 'BC': 'クッパキャッスル', 'AH': 'どんぐりツリーハウス', 'MC': 'マリオサーキット', 'RR': 'レインボーロード'}
+
+def course_key(value):
+    return unicodedata.normalize("NFKC", value).strip().casefold()
+
+TO_JAPANESE = {course_key(code): name for code, name in COURSE_CODES.items()}
+TO_CODE = {course_key(name): code for code, name in COURSE_CODES.items()}
+
+@tree.command(name="cej", description="英語のコース略称を日本語名に変換します")
+@app_commands.describe(course="英語の略称（例：MBC）")
+async def cej(interaction: discord.Interaction, course: str):
+    await interaction.response.send_message(TO_JAPANESE.get(course_key(course), "該当する略称がありません。"))
+
+@tree.command(name="cje", description="日本語のコース名を英語の略称に変換します")
+@app_commands.describe(course="日本語のコース名（例：マリオブラザーズサーキット）")
+async def cje(interaction: discord.Interaction, course: str):
+    await interaction.response.send_message(TO_CODE.get(course_key(course), "該当するコース名がありません。"))
+
 client.run(TOKEN)
