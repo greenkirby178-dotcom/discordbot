@@ -1053,6 +1053,8 @@ class PointsStore:
             if not game['active'] or game['played'] != expected_round:
                 raise ValueError('このボタンは受付済みです。/hlresume で最新の状態を表示してください。')
             if choice == 'Stop':
+                if game['played'] == 0:
+                    raise ValueError('最初の1回はHighかLowを選んでください。1勝後から確定できます。')
                 game['active'] = 0
                 game['result'] += f"\n確定しました。{game['pot']:,}ptを受け取ります。"
             else:
@@ -1100,7 +1102,7 @@ def points_game_embed(game):
                          f"{'今確定した場合の' if game['active'] else '確定'}収支 **{game['pot']-game['bet']:+,}pt**")
     if game['active']:
         embed.add_field(name=f"第{game['played']+1}ゲーム・今のカード {card_name(game['card'])}",
-                        value='勝つと全額を次へ。1回負けると挑戦ポイントは0。途中の「確定」で受け取れます。', inline=False)
+                        value='勝つと全額を次へ。1回負けると挑戦ポイントは0。1勝後から「確定」で受け取れます。', inline=False)
         for label, count in [('High', 13-game['card']), ('Low', game['card']-1)]:
             value = '選択不可（勝率0%）'
             if count:
@@ -1121,7 +1123,11 @@ class PointsHighLowView(discord.ui.View):
                              ('Stop', discord.ButtonStyle.secondary)]:
             button = discord.ui.Button(label='確定して終了' if label == 'Stop' else label,
                                        style=style, custom_id=f'points_hl:{game["id"]}:{game["played"]}:{label}')
-            button.disabled = (label == 'High' and game['card'] == 13) or (label == 'Low' and game['card'] == 1)
+            button.disabled = (
+                (label == 'Stop' and game['played'] == 0)
+                or (label == 'High' and game['card'] == 13)
+                or (label == 'Low' and game['card'] == 1)
+            )
             button.callback = self.answer
             self.add_item(button)
 
