@@ -877,4 +877,114 @@ async def suggest_course_code(interaction: discord.Interaction, current: str):
 async def suggest_course_name(interaction: discord.Interaction, current: str):
     return course_suggestions(COURSE_CODES.values(), current)
 
+
+class HighLowView(discord.ui.View):
+    def __init__(self, player_id, games, played=0, wins=0):
+        super().__init__(timeout=180)
+        self.player_id = player_id
+        self.games = games
+        self.played = played
+        self.wins = wins
+        self.card = random.randint(1, 13)
+        self.message = None
+        self.resolved = False
+        self.lock = asyncio.Lock()
+
+    @staticmethod
+    def card_name(card):
+        return {1: "A", 11: "J", 12: "Q", 13: "K"}.get(card, str(card))
+
+    def embed(self, result=None):
+        embed = discord.Embed(title="High & Low", colour=0x00CC66)
+        embed.description = (
+            f"<@{self.player_id}> のゲーム\n"
+            f"**第{self.played + 1}ゲーム / 全{self.games}ゲーム**\n"
+            f"今のカードは **{self.card_name(self.card)}** です。\n"
+            "次のカードが大きいなら **High**、小さいなら **Low** を選んでください。"
+        )
+        if result:
+            embed.add_field(name="前のゲームの結果", value=result, inline=False)
+        embed.add_field(name="成績", value=f"{self.wins}勝 {self.played - self.wins}敗")
+        embed.set_footer(text="A=1・J=11・Q=12・K=13 | 同じ数字は再抽選 | 3分間操作がないと終了")
+        return embed
+
+    async def interaction_check(self, interaction):
+        if interaction.user.id != self.player_id:
+            await interaction.response.send_message(
+                "このゲームは開始した人だけ操作できます。自分で遊ぶには /hl を使ってください。",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    async def choose(self, interaction, choice):
+        async with self.lock:
+            if self.resolved:
+                await interaction.response.send_message(
+                    "このゲームの回答は受付済みか、時間切れです。最新のボタンを使ってください。",
+                    ephemeral=True,
+                )
+                return
+            next_card = random.choice([card for card in range(1, 14) if card != self.card])
+            won = (next_card > self.card) == (choice == "High")
+            played = self.played + 1
+            wins = self.wins + int(won)
+            result = (
+                f"{self.card_name(self.card)} → {self.card_name(next_card)}"
+                f"（選択：{choice}）\n"
+                + ("✅ You Win!" if won else "❌ You Lose...")
+            )
+            next_view = None
+            if played == self.games:
+                embed = discord.Embed(
+                    title="High & Low 結果",
+                    description=f"<@{self.player_id}> の全{self.games}ゲームが終了しました！\n"
+                                f"**{wins}勝 {played - wins}敗**",
+                    colour=0x00CC66,
+                )
+                embed.add_field(name="最後のゲーム", value=result, inline=False)
+            else:
+                next_view = HighLowView(self.player_id, self.games, played, wins)
+                next_view.message = interaction.message
+                embed = next_view.embed(result)
+            await interaction.response.edit_message(embed=embed, view=next_view)
+            self.resolved = True
+            self.stop()
+
+    @discord.ui.button(label="High", style=discord.ButtonStyle.success)
+    async def high(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.choose(interaction, "High")
+
+    @discord.ui.button(label="Low", style=discord.ButtonStyle.primary)
+    async def low(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.choose(interaction, "Low")
+
+    async def on_timeout(self):
+        async with self.lock:
+            if self.resolved:
+                return
+            self.resolved = True
+            embed = discord.Embed(
+                title="High & Low 時間切れ",
+                description=f"<@{self.player_id}> のゲームを終了しました。\n"
+                            f"{self.played}/{self.games}ゲーム終了・"
+                            f"**{self.wins}勝 {self.played - self.wins}敗**\n"
+                            "もう一度遊ぶには /hl を使ってください。",
+                colour=0x808080,
+            )
+            if self.message is not None:
+                try:
+                    await self.message.edit(embed=embed, view=None)
+                except discord.HTTPException:
+                    pass
+
+
+@tree.command(name="hl", description="High・Lowボタンでハイアンドローを遊びます")
+@app_commands.describe(games="遊ぶゲーム数（1以上の整数）")
+async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1]):
+    view = HighLowView(interaction.user.id, games)
+    await interaction.response.send_message(embed=view.embed(), view=view)
+    view.message = await interaction.original_response()
+
+
 client.run(TOKEN)
