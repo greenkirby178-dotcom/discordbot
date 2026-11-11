@@ -878,113 +878,255 @@ async def suggest_course_name(interaction: discord.Interaction, current: str):
     return course_suggestions(COURSE_CODES.values(), current)
 
 
-class HighLowView(discord.ui.View):
-    def __init__(self, player_id, games, played=0, wins=0):
-        super().__init__(timeout=180)
-        self.player_id = player_id
-        self.games = games
-        self.played = played
-        self.wins = wins
-        self.card = random.randint(1, 13)
-        self.message = None
-        self.resolved = False
-        self.lock = asyncio.Lock()
+import sqlite3
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
 
-    @staticmethod
-    def card_name(card):
-        return {1: "A", 11: "J", 12: "Q", 13: "K"}.get(card, str(card))
 
-    def embed(self, result=None):
-        embed = discord.Embed(title="High & Low", colour=0x00CC66)
-        embed.description = (
-            f"<@{self.player_id}> のゲーム\n"
-            f"**第{self.played + 1}ゲーム / 全{self.games}ゲーム**\n"
-            f"今のカードは **{self.card_name(self.card)}** です。\n"
-            "次のカードが大きいなら **High**、小さいなら **Low** を選んでください。"
-        )
-        if result:
-            embed.add_field(name="前のゲームの結果", value=result, inline=False)
-        embed.add_field(name="成績", value=f"{self.wins}勝 {self.played - self.wins}敗")
-        embed.set_footer(text="A=1・J=11・Q=12・K=13 | 同じ数字は再抽選 | 3分間操作がないと終了")
-        return embed
+class PointsStore:
+    """Balances, escrow and game progress commit together in one transaction."""
+    def __init__(self, path):
+        self.path = path
+        with self.transaction() as db:
+            db.executescript("""
+                CREATE TABLE IF NOT EXISTS wallets (
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    balance INTEGER NOT NULL CHECK(balance >= 0),
+                    PRIMARY KEY(guild_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS hl_games (
+                    id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    games INTEGER NOT NULL, bet INTEGER NOT NULL,
+                    played INTEGER NOT NULL DEFAULT 0, wins INTEGER NOT NULL DEFAULT 0,
+                    card INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                    result TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS hl_one_active
+                    ON hl_games(guild_id, user_id) WHERE active=1;
+                CREATE TABLE IF NOT EXISTS point_history (
+                    id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    delta INTEGER NOT NULL, reason TEXT NOT NULL, game_id TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
 
-    async def interaction_check(self, interaction):
-        if interaction.user.id != self.player_id:
-            await interaction.response.send_message(
-                "このゲームは開始した人だけ操作できます。自分で遊ぶには /hl を使ってください。",
-                ephemeral=True,
-            )
-            return False
-        return True
+    @contextmanager
+    def transaction(self):
+        db = sqlite3.connect(self.path, timeout=10)
+        db.row_factory = sqlite3.Row
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            yield db
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.close()
 
-    async def choose(self, interaction, choice):
-        async with self.lock:
-            if self.resolved:
-                await interaction.response.send_message(
-                    "このゲームの回答は受付済みか、時間切れです。最新のボタンを使ってください。",
-                    ephemeral=True,
-                )
-                return
-            next_card = random.choice([card for card in range(1, 14) if card != self.card])
-            won = (next_card > self.card) == (choice == "High")
-            played = self.played + 1
-            wins = self.wins + int(won)
-            result = (
-                f"{self.card_name(self.card)} → {self.card_name(next_card)}"
-                f"（選択：{choice}）\n"
-                + ("✅ You Win!" if won else "❌ You Lose...")
-            )
-            next_view = None
-            if played == self.games:
-                embed = discord.Embed(
-                    title="High & Low 結果",
-                    description=f"<@{self.player_id}> の全{self.games}ゲームが終了しました！\n"
-                                f"**{wins}勝 {played - wins}敗**",
-                    colour=0x00CC66,
-                )
-                embed.add_field(name="最後のゲーム", value=result, inline=False)
+    def wallet(self, db, guild_id, user_id):
+        inserted = db.execute('INSERT OR IGNORE INTO wallets VALUES (?, ?, 1000)',
+                              (guild_id, user_id)).rowcount
+        if inserted:
+            db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason) VALUES (?,?,1000,?)',
+                       (guild_id, user_id, '初期ポイント'))
+        return db.execute('SELECT balance FROM wallets WHERE guild_id=? AND user_id=?',
+                          (guild_id, user_id)).fetchone()['balance']
+
+    def change(self, db, game, delta, reason):
+        db.execute('UPDATE wallets SET balance=balance+? WHERE guild_id=? AND user_id=?',
+                   (delta, game['guild_id'], game['user_id']))
+        db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason,game_id) VALUES (?,?,?,?,?)',
+                   (game['guild_id'], game['user_id'], delta, reason, game['id']))
+
+    def balance(self, guild_id, user_id):
+        with self.transaction() as db:
+            available = self.wallet(db, guild_id, user_id)
+            held = db.execute('SELECT COALESCE(SUM((games-played)*bet),0) FROM hl_games '
+                              'WHERE guild_id=? AND user_id=? AND active=1',
+                              (guild_id, user_id)).fetchone()[0]
+            return available, held
+
+    def active_games(self):
+        with self.transaction() as db:
+            return [dict(row) for row in db.execute('SELECT * FROM hl_games WHERE active=1')]
+
+    def resume(self, guild_id, user_id):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM hl_games WHERE guild_id=? AND user_id=? AND active=1',
+                             (guild_id, user_id)).fetchone()
+            if row is None:
+                raise ValueError('進行中のゲームがありません。/hl で開始してください。')
+            return dict(row)
+
+    def start(self, guild_id, user_id, games, bet):
+        if not 1 <= games <= 1000 or not 0 <= bet <= 1000000:
+            raise ValueError('ゲーム数は1〜1000、賭け額は0〜1,000,000ポイントで指定してください。')
+        with self.transaction() as db:
+            balance = self.wallet(db, guild_id, user_id)
+            if db.execute('SELECT 1 FROM hl_games WHERE guild_id=? AND user_id=? AND active=1',
+                          (guild_id, user_id)).fetchone():
+                raise ValueError('進行中のゲームがあります。/hlresume で再表示できます。')
+            cost = games * bet
+            if balance < cost:
+                raise ValueError(f'ポイントが足りません。全{games}ゲーム分の{cost:,}ptが必要です（利用可能：{balance:,}pt）。')
+            game = dict(id=uuid.uuid4().hex, guild_id=guild_id, user_id=user_id)
+            db.execute('INSERT INTO hl_games(id,guild_id,user_id,games,bet,card) VALUES (?,?,?,?,?,?)',
+                       (game['id'], guild_id, user_id, games, bet, random.randint(1, 13)))
+            self.change(db, game, -cost, 'High Low 全ゲーム分預かり')
+            return dict(db.execute('SELECT * FROM hl_games WHERE id=?', (game['id'],)).fetchone())
+
+    def answer(self, game_id, user_id, guild_id, expected_round, choice):
+        if choice not in ('High', 'Low', 'Stop'):
+            raise ValueError('回答が不正です。')
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM hl_games WHERE id=?', (game_id,)).fetchone()
+            if row is None or row['user_id'] != user_id or row['guild_id'] != guild_id:
+                raise ValueError('このゲームは開始した人だけ操作できます。')
+            game = dict(row)
+            if not game['active'] or game['played'] != expected_round:
+                raise ValueError('このボタンは受付済みです。/hlresume で最新の状態を表示してください。')
+            if choice == 'Stop':
+                refund = (game['games'] - game['played']) * game['bet']
+                self.change(db, game, refund, 'High Low 未プレイ分返却')
+                game['active'] = 0
+                game['result'] += f'\n終了しました。未プレイ分 {refund:,}ptを返却しました。'
             else:
-                next_view = HighLowView(self.player_id, self.games, played, wins)
-                next_view.message = interaction.message
-                embed = next_view.embed(result)
-            await interaction.response.edit_message(embed=embed, view=next_view)
-            self.resolved = True
-            self.stop()
-
-    @discord.ui.button(label="High", style=discord.ButtonStyle.success)
-    async def high(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.choose(interaction, "High")
-
-    @discord.ui.button(label="Low", style=discord.ButtonStyle.primary)
-    async def low(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await self.choose(interaction, "Low")
-
-    async def on_timeout(self):
-        async with self.lock:
-            if self.resolved:
-                return
-            self.resolved = True
-            embed = discord.Embed(
-                title="High & Low 時間切れ",
-                description=f"<@{self.player_id}> のゲームを終了しました。\n"
-                            f"{self.played}/{self.games}ゲーム終了・"
-                            f"**{self.wins}勝 {self.played - self.wins}敗**\n"
-                            "もう一度遊ぶには /hl を使ってください。",
-                colour=0x808080,
-            )
-            if self.message is not None:
-                try:
-                    await self.message.edit(embed=embed, view=None)
-                except discord.HTTPException:
-                    pass
+                next_card = random.choice([n for n in range(1, 14) if n != game['card']])
+                won = (next_card > game['card']) == (choice == 'High')
+                payout = game['bet'] * 2 if won else 0
+                self.change(db, game, payout, f'High Low 第{game["played"]+1}ゲーム {choice}')
+                game['result'] = (f'{card_name(game["card"])} → {card_name(next_card)}（{choice}）\n'
+                                  + ('✅ 勝ち' if won else '❌ 負け')
+                                  + f'・収支 {game["bet"] if won else -game["bet"]:+,}pt')
+                game['played'] += 1
+                game['wins'] += int(won)
+                game['active'] = int(game['played'] < game['games'])
+                game['card'] = random.randint(1, 13)
+            db.execute('UPDATE hl_games SET played=?,wins=?,card=?,active=?,result=? WHERE id=?',
+                       (game['played'], game['wins'], game['card'], game['active'], game['result'], game_id))
+            return game
 
 
-@tree.command(name="hl", description="High・Lowボタンでハイアンドローを遊びます")
-@app_commands.describe(games="遊ぶゲーム数（1以上の整数）")
-async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1]):
-    view = HighLowView(interaction.user.id, games)
-    await interaction.response.send_message(embed=view.embed(), view=view)
-    view.message = await interaction.original_response()
+points_store = None
+
+
+def card_name(card):
+    return {1: 'A', 11: 'J', 12: 'Q', 13: 'K'}.get(card, str(card))
+
+
+def points_game_embed(game):
+    losses = game['played'] - game['wins']
+    embed = discord.Embed(title='High & Low' if game['active'] else 'High & Low 結果', colour=0x00CC66)
+    embed.description = (f'<@{game["user_id"]}> ・1ゲーム **{game["bet"]:,}pt**\n'
+                         f'終了 {game["played"]}/{game["games"]}ゲーム・**{game["wins"]}勝 {losses}敗**\n'
+                         f'合計収支 **{(game["wins"]-losses)*game["bet"]:+,}pt**')
+    if game['active']:
+        embed.add_field(name=f'第{game["played"]+1}ゲーム',
+                        value=f'今のカード：**{card_name(game["card"])}**\n次が大きければ High、小さければ Low', inline=False)
+    if game['result']:
+        embed.add_field(name='結果', value=game['result'], inline=False)
+    embed.set_footer(text='A=1・J=11・Q=12・K=13｜同数は再抽選｜中断後は /hlresume｜残高は /points')
+    return embed
+
+
+class PointsHighLowView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=None)
+        self.game = game
+        for label, style in [('High', discord.ButtonStyle.success),
+                             ('Low', discord.ButtonStyle.primary),
+                             ('Stop', discord.ButtonStyle.secondary)]:
+            button = discord.ui.Button(label='終了・未プレイ分返却' if label == 'Stop' else label,
+                                       style=style, custom_id=f'points_hl:{game["id"]}:{game["played"]}:{label}')
+            button.callback = self.answer
+            self.add_item(button)
+
+    async def answer(self, interaction):
+        await interaction.response.defer()
+        choice = interaction.data['custom_id'].rsplit(':', 1)[1]
+        try:
+            game = await asyncio.to_thread(points_store.answer, self.game['id'], interaction.user.id,
+                                           interaction.guild_id, self.game['played'], choice)
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        next_view = PointsHighLowView(game) if game['active'] else None
+        if next_view:
+            client.add_view(next_view)
+        # The result is already durable. A failed Discord edit can be recovered with /hlresume.
+        await interaction.edit_original_response(embed=points_game_embed(game), view=next_view)
+        self.stop()
+
+    async def on_error(self, interaction, error, item):
+        print(f'Points game error: {type(error).__name__}: {error}')
+        await interaction.followup.send('表示の更新に失敗しました。/points と /hlresume で保存済みの状態を確認してください。', ephemeral=True)
+
+
+@client.event
+async def setup_hook():
+    global points_store
+    path = Path(os.getenv('POINTS_DB_PATH', '/var/data/points.sqlite3'))
+    # Fail closed if the persistent disk is missing; never create an ephemeral wallet database.
+    if not path.parent.is_dir():
+        raise RuntimeError('ポイント保存先がありません。/var/data に永続ディスクを設定してください。')
+    points_store = await asyncio.to_thread(PointsStore, str(path))
+    for game in await asyncio.to_thread(points_store.active_games):
+        client.add_view(PointsHighLowView(game))
+    print(f'Points database ready: {path}', flush=True)
+
+
+@tree.command(name='hl', description='High・Lowボタンでポイントを賭けて遊びます')
+@app_commands.guild_only()
+@app_commands.describe(games='ゲーム数（1〜1000）', bet='1ゲームの賭けポイント（省略・0なら練習）。全ゲーム分を先に預かります')
+async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1, 1000],
+             bet: app_commands.Range[int, 0, 1000000] = 0):
+    await interaction.response.defer()
+    try:
+        game = await asyncio.to_thread(points_store.start, interaction.guild_id, interaction.user.id, games, bet)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    view = PointsHighLowView(game)
+    client.add_view(view)
+    await interaction.followup.send(embed=points_game_embed(game), view=view)
+
+
+@tree.command(name='points', description='自分の所持ポイントとゲーム中の預かりポイントを表示します')
+@app_commands.guild_only()
+async def points(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    available, held = await asyncio.to_thread(points_store.balance, interaction.guild_id, interaction.user.id)
+    await interaction.followup.send(f'所持ポイント：**{available+held:,}pt**\n利用可能：{available:,}pt\nゲーム用預かり：{held:,}pt\n初回1,000pt・サーバーごとに保存', ephemeral=True)
+
+
+@tree.command(name='hlresume', description='保存されたHigh Lowの続きを表示します')
+@app_commands.guild_only()
+async def hlresume(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        game = await asyncio.to_thread(points_store.resume, interaction.guild_id, interaction.user.id)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+        return
+    view = PointsHighLowView(game)
+    client.add_view(view)
+    await interaction.followup.send(embed=points_game_embed(game), view=view)
+
+
+@hl.error
+@points.error
+@hlresume.error
+async def points_command_error(interaction: discord.Interaction, error):
+    print(f'Points command error: {error}')
+    text = 'ポイント処理に失敗しました。/points と /hlresume で状態を確認してください。'
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
 
 
 client.run(TOKEN)
+
