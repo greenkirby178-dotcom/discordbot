@@ -1294,8 +1294,9 @@ async def make_points_ranking(guild, owner_id, mode):
 async def points_ranking(interaction: discord.Interaction, mode: str = '10'):
     await interaction.response.defer()
     view = await make_points_ranking(interaction.guild, interaction.user.id, mode)
-    await interaction.followup.send(embed=view.embed(), view=view if view.pages > 1 else None,
-                                    allowed_mentions=discord.AllowedMentions.none())
+    await interaction.followup.send(embed=view.embed(),
+                                    allowed_mentions=discord.AllowedMentions.none(),
+                                    **({'view': view} if view.pages > 1 else {}))
 
 
 @tree.command(name='hlresume', description='保存されたHigh Lowの続きを表示します')
