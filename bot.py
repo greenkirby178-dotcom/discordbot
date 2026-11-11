@@ -1013,6 +1013,19 @@ class PointsStore:
                               (guild_id, user_id)).fetchone()[0]
             return available, held
 
+    def winrate(self, guild_id, user_id):
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT COUNT(*) AS challenges, COALESCE(SUM(played),0) AS rounds, "
+                "COALESCE(SUM(wins),0) AS wins, COALESCE(SUM(pot-bet),0) AS profit "
+                "FROM hl_games g WHERE guild_id=? AND user_id=? AND active=0 AND bet>0 AND played>0 "
+                "AND result != 'ポイントリセットにより終了しました。' "
+                "AND EXISTS (SELECT 1 FROM point_history h WHERE h.game_id=g.id "
+                "AND h.reason='High Low 挑戦開始')",
+                (guild_id, user_id),
+            ).fetchone()
+            return dict(row)
+
     def active_games(self):
         with self.transaction() as db:
             return [dict(row) for row in db.execute('SELECT * FROM hl_games WHERE active=1')]
@@ -1203,6 +1216,16 @@ async def hlresume(interaction: discord.Interaction):
     await interaction.followup.send(embed=points_game_embed(game), view=view)
 
 
+@tree.command(name='winrate', description='High Lowの勝率と累計収支を表示します')
+@app_commands.guild_only()
+async def winrate(interaction: discord.Interaction):
+    await interaction.response.defer()
+    stats = await asyncio.to_thread(points_store.winrate, interaction.guild_id, interaction.user.id)
+    await interaction.followup.send(winrate_text(interaction.user.mention, stats),
+                                    allowed_mentions=discord.AllowedMentions.none())
+
+
+@winrate.error
 @hl.error
 @points.error
 @hlresume.error
@@ -1216,6 +1239,17 @@ async def points_command_error(interaction: discord.Interaction, error):
 
 
 
+def winrate_text(mention, stats):
+    rounds = stats['rounds']
+    rate = f"{stats['wins'] / rounds * 100:.2f}%" if rounds else '記録なし'
+    return (f"**{mention} のHigh & Low成績**\n"
+            f"勝率：**{rate}**（{stats['wins']}勝 {rounds-stats['wins']}敗）\n"
+            f"累計収支：**{stats['profit']:+,}pt**\n"
+            f"終了した挑戦：{stats['challenges']}回・回答：{rounds}回\n"
+            "集計対象：ポイントリセット後、このサーバーで終了したポイントを賭けた挑戦。\n"
+            "勝率はHigh／Lowの回答ごと、収支は受取額−投入額です。")
+
+
 def points_text(available, held):
     return (f'所持ポイント：**{available+held:,}pt**\n利用可能：{available:,}pt\n'
             f'挑戦中（未確定）：{held:,}pt\n初回500pt・10チャットで1pt・サーバーごとに保存')
@@ -1223,9 +1257,16 @@ def points_text(available, held):
 
 async def handle_points_prefix(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ('!arp', '!arhl', '!arhlresume'):
+    if not parts or parts[0] not in ('!arp', '!arhl', '!arhlresume', '!arwr'):
         return False
     try:
+        if parts[0] == '!arwr':
+            if len(parts) != 1:
+                raise ValueError('使い方：`!arwr`')
+            stats = await asyncio.to_thread(points_store.winrate, message.guild.id, message.author.id)
+            await message.reply(winrate_text(message.author.mention, stats), mention_author=False,
+                                allowed_mentions=discord.AllowedMentions.none())
+            return True
         if parts[0] == '!arp':
             if len(parts) != 1:
                 raise ValueError('使い方：`!arp`')
