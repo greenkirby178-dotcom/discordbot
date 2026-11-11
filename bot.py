@@ -1013,6 +1013,15 @@ class PointsStore:
                               (guild_id, user_id)).fetchone()[0]
             return available, held
 
+    def ranking(self, guild_id):
+        with self.transaction() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT w.user_id, w.balance + COALESCE(g.pot,0) AS points "
+                "FROM wallets w LEFT JOIN hl_games g ON g.guild_id=w.guild_id "
+                "AND g.user_id=w.user_id AND g.active=1 WHERE w.guild_id=? "
+                "ORDER BY points DESC, w.user_id ASC", (guild_id,)
+            )]
+
     def winrate(self, guild_id, user_id):
         with self.transaction() as db:
             row = db.execute(
@@ -1162,7 +1171,7 @@ class PointsHighLowView(discord.ui.View):
 
     async def on_error(self, interaction, error, item):
         print(f'Points game error: {type(error).__name__}: {error}')
-        await interaction.followup.send('表示の更新に失敗しました。/points と /hlresume で保存済みの状態を確認してください。', ephemeral=True)
+        await interaction.followup.send('表示の更新に失敗しました。/points balance と /hlresume で保存済みの状態を確認してください。', ephemeral=True)
 
 
 @client.event
@@ -1194,12 +1203,99 @@ async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1,
     await interaction.followup.send(embed=points_game_embed(game), view=view)
 
 
-@tree.command(name='points', description='自分の所持ポイントとゲーム中の預かりポイントを表示します')
+points_group = app_commands.Group(name='points', description='ポイント残高とランキング')
+tree.add_command(points_group)
+
+
+@points_group.command(name='balance', description='自分の所持ポイントを表示します')
 @app_commands.guild_only()
 async def points(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     available, held = await asyncio.to_thread(points_store.balance, interaction.guild_id, interaction.user.id)
     await interaction.followup.send(points_text(available, held), ephemeral=True)
+
+
+
+class PointsRankingView(discord.ui.View):
+    def __init__(self, owner_id, rows, mode):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.rows = rows if mode == 'all' else rows[:int(mode)]
+        self.page = 0
+        self.lock = asyncio.Lock()
+        self.pages = max(1, (len(self.rows) + 19) // 20)
+        self.update_buttons()
+
+    def update_buttons(self):
+        self.previous.disabled = self.page == 0
+        self.next_page.disabled = self.page == self.pages - 1
+
+    def embed(self):
+        embed = discord.Embed(title='サーバーポイントランキング', colour=0x00CC66)
+        start = self.page * 20
+        lines = []
+        for index in range(start, min(start + 20, len(self.rows))):
+            row = self.rows[index]
+            lines.append(f"**{row['rank']}位** <@{row['user_id']}> — **{row['points']:,}pt**")
+        embed.description = '\n'.join(lines) or 'ポイント登録済みのメンバーがいません。'
+        embed.set_footer(text=f'{self.page+1}/{self.pages}ページ・{len(self.rows)}人｜同点は同順位｜挑戦中のポイント込み・取得時点の順位')
+        return embed
+
+    async def move(self, interaction, offset):
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message('ページ操作は実行者のみです。自分で /points ranking または !arpr を使ってください。', ephemeral=True)
+            return
+        async with self.lock:
+            self.page = max(0, min(self.pages - 1, self.page + offset))
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.embed(), view=self)
+
+    @discord.ui.button(label='前のページ', style=discord.ButtonStyle.secondary)
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.move(interaction, -1)
+
+    @discord.ui.button(label='次のページ', style=discord.ButtonStyle.secondary)
+    async def next_page(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.move(interaction, 1)
+
+
+async def make_points_ranking(guild, owner_id, mode):
+    rows = await asyncio.to_thread(points_store.ranking, guild.id)
+    members = []
+    previous_points = None
+    rank = 0
+    for row in rows:
+        member = guild.get_member(row['user_id'])
+        if member is None:
+            try:
+                member = await guild.fetch_member(row['user_id'])
+            except discord.NotFound:
+                continue
+        if member.bot:
+            continue
+        if row['points'] != previous_points:
+            rank = len(members) + 1
+        row['rank'] = rank
+        previous_points = row['points']
+        members.append(row)
+        if mode != 'all' and len(members) == int(mode):
+            break
+    return PointsRankingView(owner_id, members, mode)
+
+
+@points_group.command(name='ranking', description='サーバーのポイントランキングを表示します')
+@app_commands.guild_only()
+@app_commands.describe(mode='ランキングの表示形式')
+@app_commands.choices(mode=[
+    app_commands.Choice(name='top5', value='5'),
+    app_commands.Choice(name='top10', value='10'),
+    app_commands.Choice(name='メンバー全員', value='all'),
+])
+async def points_ranking(interaction: discord.Interaction, mode: str = '10'):
+    await interaction.response.defer()
+    view = await make_points_ranking(interaction.guild, interaction.user.id, mode)
+    await interaction.followup.send(embed=view.embed(), view=view if view.pages > 1 else None,
+                                    allowed_mentions=discord.AllowedMentions.none())
 
 
 @tree.command(name='hlresume', description='保存されたHigh Lowの続きを表示します')
@@ -1225,13 +1321,14 @@ async def winrate(interaction: discord.Interaction):
                                     allowed_mentions=discord.AllowedMentions.none())
 
 
+@points_ranking.error
 @winrate.error
 @hl.error
 @points.error
 @hlresume.error
 async def points_command_error(interaction: discord.Interaction, error):
     print(f'Points command error: {error}')
-    text = 'ポイント処理に失敗しました。/points と /hlresume で状態を確認してください。'
+    text = 'ポイント処理に失敗しました。/points balance と /hlresume で状態を確認してください。'
     if interaction.response.is_done():
         await interaction.followup.send(text, ephemeral=True)
     else:
@@ -1257,9 +1354,18 @@ def points_text(available, held):
 
 async def handle_points_prefix(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ('!arp', '!arhl', '!arhlresume', '!arwr'):
+    if not parts or parts[0] not in ('!arp', '!arhl', '!arhlresume', '!arwr', '!arpr'):
         return False
     try:
+        if parts[0] == '!arpr':
+            modes = {'top5': '5', 'top10': '10', 'all': 'all', '全員': 'all'}
+            if len(parts) > 2 or (len(parts) == 2 and parts[1] not in modes):
+                raise ValueError('使い方：`!arpr [top5 / top10 / all]`（省略時はtop10）')
+            mode = modes[parts[1]] if len(parts) == 2 else '10'
+            view = await make_points_ranking(message.guild, message.author.id, mode)
+            await message.reply(embed=view.embed(), view=view if view.pages > 1 else None,
+                                mention_author=False, allowed_mentions=discord.AllowedMentions.none())
+            return True
         if parts[0] == '!arwr':
             if len(parts) != 1:
                 raise ValueError('使い方：`!arwr`')
