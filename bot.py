@@ -82,7 +82,7 @@ async def on_ready():
 async def on_message(message):
 
     # DMとBotの発言は対象外
-    if message.guild is None or message.author.bot:
+    if message.guild is None or message.author.bot or message.webhook_id is not None:
         return
 
     role = discord.utils.get(message.guild.roles, name="チャット規制")
@@ -94,6 +94,12 @@ async def on_message(message):
             pass
         return
 
+    try:
+        await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
+    except sqlite3.Error as error:
+        print(f"Chat reward failed: {error}")
+    if await handle_points_prefix(message):
+        return
     await handle_arc(message)
 
 @tree.command(
@@ -905,6 +911,14 @@ class PointsStore:
                 );
                 CREATE UNIQUE INDEX IF NOT EXISTS hl_one_active
                     ON hl_games(guild_id, user_id) WHERE active=1;
+                CREATE TABLE IF NOT EXISTS chat_counts (
+                    guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                    count INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(guild_id, user_id)
+                );
+                CREATE TABLE IF NOT EXISTS rewarded_messages (
+                    message_id INTEGER PRIMARY KEY
+                );
                 CREATE TABLE IF NOT EXISTS point_history (
                     id INTEGER PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
                     delta INTEGER NOT NULL, reason TEXT NOT NULL, game_id TEXT,
@@ -927,10 +941,10 @@ class PointsStore:
             db.close()
 
     def wallet(self, db, guild_id, user_id):
-        inserted = db.execute('INSERT OR IGNORE INTO wallets VALUES (?, ?, 1000)',
+        inserted = db.execute('INSERT OR IGNORE INTO wallets VALUES (?, ?, 500)',
                               (guild_id, user_id)).rowcount
         if inserted:
-            db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason) VALUES (?,?,1000,?)',
+            db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason) VALUES (?,?,500,?)',
                        (guild_id, user_id, '初期ポイント'))
         return db.execute('SELECT balance FROM wallets WHERE guild_id=? AND user_id=?',
                           (guild_id, user_id)).fetchone()['balance']
@@ -940,6 +954,24 @@ class PointsStore:
                    (delta, game['guild_id'], game['user_id']))
         db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason,game_id) VALUES (?,?,?,?,?)',
                    (game['guild_id'], game['user_id'], delta, reason, game['id']))
+
+    def record_chat(self, guild_id, user_id, message_id):
+        with self.transaction() as db:
+            # A redelivered message must not award a second point or count twice.
+            if not db.execute('INSERT OR IGNORE INTO rewarded_messages VALUES (?)',
+                              (message_id,)).rowcount:
+                return
+            self.wallet(db, guild_id, user_id)
+            db.execute('INSERT INTO chat_counts VALUES (?,?,1) '
+                       'ON CONFLICT(guild_id,user_id) DO UPDATE SET count=count+1',
+                       (guild_id, user_id))
+            count = db.execute('SELECT count FROM chat_counts WHERE guild_id=? AND user_id=?',
+                               (guild_id, user_id)).fetchone()[0]
+            if count % 10 == 0:
+                db.execute('UPDATE wallets SET balance=balance+1 WHERE guild_id=? AND user_id=?',
+                           (guild_id, user_id))
+                db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason) VALUES (?,?,1,?)',
+                           (guild_id, user_id, '10チャット報酬'))
 
     def balance(self, guild_id, user_id):
         with self.transaction() as db:
@@ -1099,7 +1131,7 @@ async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1,
 async def points(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     available, held = await asyncio.to_thread(points_store.balance, interaction.guild_id, interaction.user.id)
-    await interaction.followup.send(f'所持ポイント：**{available+held:,}pt**\n利用可能：{available:,}pt\nゲーム用預かり：{held:,}pt\n初回1,000pt・サーバーごとに保存', ephemeral=True)
+    await interaction.followup.send(points_text(available, held), ephemeral=True)
 
 
 @tree.command(name='hlresume', description='保存されたHigh Lowの続きを表示します')
@@ -1128,5 +1160,45 @@ async def points_command_error(interaction: discord.Interaction, error):
         await interaction.response.send_message(text, ephemeral=True)
 
 
+
+def points_text(available, held):
+    return (f'所持ポイント：**{available+held:,}pt**\n利用可能：{available:,}pt\n'
+            f'ゲーム用預かり：{held:,}pt\n初回500pt・10チャットで1pt・サーバーごとに保存')
+
+
+async def handle_points_prefix(message):
+    parts = message.content.split()
+    if not parts or parts[0] not in ('!arp', '!arhl', '!arhlresume'):
+        return False
+    try:
+        if parts[0] == '!arp':
+            if len(parts) != 1:
+                raise ValueError('使い方：`!arp`')
+            available, held = await asyncio.to_thread(points_store.balance, message.guild.id, message.author.id)
+            await message.reply(points_text(available, held), mention_author=False)
+            return True
+        if parts[0] == '!arhlresume':
+            if len(parts) != 1:
+                raise ValueError('使い方：`!arhlresume`')
+            game = await asyncio.to_thread(points_store.resume, message.guild.id, message.author.id)
+        else:
+            if len(parts) not in (2, 3) or any(not re.fullmatch(r'[0-9]{1,7}', part) for part in parts[1:]):
+                raise ValueError('使い方：`!arhl ゲーム数 [1ゲームの賭け額]`（例：`!arhl 10 50`）')
+            games = int(parts[1])
+            bet = int(parts[2]) if len(parts) == 3 else 0
+            game = await asyncio.to_thread(points_store.start, message.guild.id, message.author.id, games, bet)
+        view = PointsHighLowView(game)
+        client.add_view(view)
+        await message.reply(embed=points_game_embed(game), view=view, mention_author=False)
+    except ValueError as error:
+        await message.reply(str(error), mention_author=False)
+    except (sqlite3.Error, discord.HTTPException) as error:
+        print(f'Points prefix command failed: {error}')
+        await message.reply('処理または表示に失敗しました。!arp と !arhlresume で保存状態を確認してください。',
+                            mention_author=False)
+    return True
+
+
 client.run(TOKEN)
+
 
