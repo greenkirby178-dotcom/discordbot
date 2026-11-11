@@ -886,8 +886,11 @@ async def suggest_course_name(interaction: discord.Interaction, current: str):
 
 import sqlite3
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, closing
 from pathlib import Path
+
+
+MAX_HL_POT = 10**12
 
 
 class PointsStore:
@@ -925,6 +928,35 @@ class PointsStore:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 );
             """)
+
+        self.migrate_streak_reset()
+
+    def migrate_streak_reset(self):
+        migration = '2026-11-11-streak-reset-v1'
+        # Hold the write lock through backup and reset so the backup is the exact pre-reset state.
+        with self.transaction() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS point_migrations '
+                       '(name TEXT PRIMARY KEY, backup_path TEXT NOT NULL)')
+            applied = db.execute('SELECT backup_path FROM point_migrations WHERE name=?', (migration,)).fetchone()
+            if applied:
+                print(f'Points reset already applied; backup: {applied[0]}', flush=True)
+                return
+            backup_path = str(Path(self.path).with_name(f'points-before-streak-{uuid.uuid4().hex}.sqlite3'))
+            with closing(sqlite3.connect(self.path)) as source, closing(sqlite3.connect(backup_path)) as target:
+                source.backup(target)
+                if target.execute('PRAGMA integrity_check').fetchone()[0] != 'ok':
+                    raise RuntimeError('ポイントのバックアップ検証に失敗しました。リセットを中止します。')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(hl_games)')}
+            if 'pot' not in columns:
+                db.execute('ALTER TABLE hl_games ADD COLUMN pot INTEGER NOT NULL DEFAULT 0')
+            count = db.execute('SELECT COUNT(*) FROM wallets').fetchone()[0]
+            db.execute("INSERT INTO point_history(guild_id,user_id,delta,reason) "
+                       "SELECT guild_id,user_id,500-balance,'管理者依頼：500ptにリセット' FROM wallets")
+            db.execute('UPDATE wallets SET balance=500')
+            db.execute("UPDATE hl_games SET active=0,pot=0,result='ポイントリセットにより終了しました。' WHERE active=1")
+            db.execute('DELETE FROM chat_counts')
+            db.execute('INSERT INTO point_migrations VALUES (?,?)', (migration, backup_path))
+        print(f'Points reset complete: {count} wallets set to 500; games and chat counts reset; backup: {backup_path}', flush=True)
 
     @contextmanager
     def transaction(self):
@@ -976,7 +1008,7 @@ class PointsStore:
     def balance(self, guild_id, user_id):
         with self.transaction() as db:
             available = self.wallet(db, guild_id, user_id)
-            held = db.execute('SELECT COALESCE(SUM((games-played)*bet),0) FROM hl_games '
+            held = db.execute('SELECT COALESCE(SUM(pot),0) FROM hl_games '
                               'WHERE guild_id=? AND user_id=? AND active=1',
                               (guild_id, user_id)).fetchone()[0]
             return available, held
@@ -1001,13 +1033,13 @@ class PointsStore:
             if db.execute('SELECT 1 FROM hl_games WHERE guild_id=? AND user_id=? AND active=1',
                           (guild_id, user_id)).fetchone():
                 raise ValueError('進行中のゲームがあります。/hlresume で再表示できます。')
-            cost = games * bet
+            cost = bet
             if balance < cost:
-                raise ValueError(f'ポイントが足りません。全{games}ゲーム分の{cost:,}ptが必要です（利用可能：{balance:,}pt）。')
+                raise ValueError(f'ポイントが足りません。この挑戦には{cost:,}ptが必要です（利用可能：{balance:,}pt）。')
             game = dict(id=uuid.uuid4().hex, guild_id=guild_id, user_id=user_id)
-            db.execute('INSERT INTO hl_games(id,guild_id,user_id,games,bet,card) VALUES (?,?,?,?,?,?)',
-                       (game['id'], guild_id, user_id, games, bet, random.randint(1, 13)))
-            self.change(db, game, -cost, 'High Low 全ゲーム分預かり')
+            db.execute('INSERT INTO hl_games(id,guild_id,user_id,games,bet,card,pot) VALUES (?,?,?,?,?,?,?)',
+                       (game['id'], guild_id, user_id, games, bet, random.randint(1, 13), bet))
+            self.change(db, game, -cost, 'High Low 挑戦開始')
             return dict(db.execute('SELECT * FROM hl_games WHERE id=?', (game['id'],)).fetchone())
 
     def answer(self, game_id, user_id, guild_id, expected_round, choice):
@@ -1021,24 +1053,30 @@ class PointsStore:
             if not game['active'] or game['played'] != expected_round:
                 raise ValueError('このボタンは受付済みです。/hlresume で最新の状態を表示してください。')
             if choice == 'Stop':
-                refund = (game['games'] - game['played']) * game['bet']
-                self.change(db, game, refund, 'High Low 未プレイ分返却')
                 game['active'] = 0
-                game['result'] += f'\n終了しました。未プレイ分 {refund:,}ptを返却しました。'
+                game['result'] += f"\n確定しました。{game['pot']:,}ptを受け取ります。"
             else:
+                winning_cards = 13 - game['card'] if choice == 'High' else game['card'] - 1
+                if winning_cards == 0:
+                    raise ValueError('その選択は勝率0%です。もう一方か「確定」を選んでください。')
                 next_card = random.choice([n for n in range(1, 14) if n != game['card']])
                 won = (next_card > game['card']) == (choice == 'High')
-                payout = game['bet'] * 2 if won else 0
-                self.change(db, game, payout, f'High Low 第{game["played"]+1}ゲーム {choice}')
-                game['result'] = (f'{card_name(game["card"])} → {card_name(next_card)}（{choice}）\n'
-                                  + ('✅ 勝ち' if won else '❌ 負け')
-                                  + f'・収支 {game["bet"] if won else -game["bet"]:+,}pt')
+                previous_pot = game['pot']
+                game['pot'] = hl_payout(previous_pot, winning_cards) if won else 0
                 game['played'] += 1
                 game['wins'] += int(won)
-                game['active'] = int(game['played'] < game['games'])
+                game['active'] = int(won and game['played'] < game['games']
+                                     and (game['bet'] == 0 or 0 < game['pot'] < MAX_HL_POT))
+                game['result'] = (f"{card_name(game['card'])} → {card_name(next_card)}（{choice}）\n"
+                                  + ('✅ 勝ち' if won else '❌ 負け・挑戦分は全ロスト')
+                                  + f"\n{previous_pot:,}pt → {game['pot']:,}pt")
+                if won and not game['active']:
+                    game['result'] += f"\n終了・{game['pot']:,}ptを自動確定しました。"
                 game['card'] = random.randint(1, 13)
-            db.execute('UPDATE hl_games SET played=?,wins=?,card=?,active=?,result=? WHERE id=?',
-                       (game['played'], game['wins'], game['card'], game['active'], game['result'], game_id))
+            if not game['active']:
+                self.change(db, game, game['pot'], 'High Low 挑戦精算')
+            db.execute('UPDATE hl_games SET played=?,wins=?,card=?,active=?,result=?,pot=? WHERE id=?',
+                       (game['played'], game['wins'], game['card'], game['active'], game['result'], game['pot'], game_id))
             return game
 
 
@@ -1049,18 +1087,28 @@ def card_name(card):
     return {1: 'A', 11: 'J', 12: 'Q', 13: 'K'}.get(card, str(card))
 
 
+def hl_payout(pot, winning_cards):
+    # Exact integer arithmetic: 95% expected return, including the stake, rounded down.
+    return min(MAX_HL_POT, pot * 95 * 12 // (100 * winning_cards))
+
+
 def points_game_embed(game):
-    losses = game['played'] - game['wins']
-    embed = discord.Embed(title='High & Low' if game['active'] else 'High & Low 結果', colour=0x00CC66)
-    embed.description = (f'<@{game["user_id"]}> ・1ゲーム **{game["bet"]:,}pt**\n'
-                         f'終了 {game["played"]}/{game["games"]}ゲーム・**{game["wins"]}勝 {losses}敗**\n'
-                         f'合計収支 **{(game["wins"]-losses)*game["bet"]:+,}pt**')
+    embed = discord.Embed(title='High & Low 連勝チャレンジ' if game['active'] else 'High & Low 結果', colour=0x00CC66)
+    embed.description = (f"<@{game['user_id']}> ・開始時の投入 **{game['bet']:,}pt**\n"
+                         f"{game['played']}/{game['games']}回終了・{game['wins']}勝\n"
+                         f"現在の挑戦ポイント **{game['pot']:,}pt**\n"
+                         f"{'今確定した場合の' if game['active'] else '確定'}収支 **{game['pot']-game['bet']:+,}pt**")
     if game['active']:
-        embed.add_field(name=f'第{game["played"]+1}ゲーム',
-                        value=f'今のカード：**{card_name(game["card"])}**\n次が大きければ High、小さければ Low', inline=False)
+        embed.add_field(name=f"第{game['played']+1}ゲーム・今のカード {card_name(game['card'])}",
+                        value='勝つと全額を次へ。1回負けると挑戦ポイントは0。途中の「確定」で受け取れます。', inline=False)
+        for label, count in [('High', 13-game['card']), ('Low', game['card']-1)]:
+            value = '選択不可（勝率0%）'
+            if count:
+                value = f"勝率 {count}/12・勝った場合 **{hl_payout(game['pot'], count):,}pt**（元手込み）"
+            embed.add_field(name=label, value=value, inline=False)
     if game['result']:
-        embed.add_field(name='結果', value=game['result'], inline=False)
-    embed.set_footer(text='A=1・J=11・Q=12・K=13｜同数は再抽選｜中断後は /hlresume｜残高は /points')
+        embed.add_field(name='直前の結果', value=game['result'], inline=False)
+    embed.set_footer(text='期待払戻率95%・端数切捨て｜A=1/K=13・同数再抽選｜上限1兆ptで自動確定｜/hlresumeで再開')
     return embed
 
 
@@ -1071,8 +1119,9 @@ class PointsHighLowView(discord.ui.View):
         for label, style in [('High', discord.ButtonStyle.success),
                              ('Low', discord.ButtonStyle.primary),
                              ('Stop', discord.ButtonStyle.secondary)]:
-            button = discord.ui.Button(label='終了・未プレイ分返却' if label == 'Stop' else label,
+            button = discord.ui.Button(label='確定して終了' if label == 'Stop' else label,
                                        style=style, custom_id=f'points_hl:{game["id"]}:{game["played"]}:{label}')
+            button.disabled = (label == 'High' and game['card'] == 13) or (label == 'Low' and game['card'] == 1)
             button.callback = self.answer
             self.add_item(button)
 
@@ -1112,7 +1161,7 @@ async def setup_hook():
 
 @tree.command(name='hl', description='High・Lowボタンでポイントを賭けて遊びます')
 @app_commands.guild_only()
-@app_commands.describe(games='ゲーム数（1〜1000）', bet='1ゲームの賭けポイント（省略・0なら練習）。全ゲーム分を先に預かります')
+@app_commands.describe(games='目標の連勝数（1〜1000）', bet='この挑戦に投入するポイント（省略・0なら練習）。1敗で挑戦分全ロスト')
 async def hl(interaction: discord.Interaction, games: app_commands.Range[int, 1, 1000],
              bet: app_commands.Range[int, 0, 1000000] = 0):
     await interaction.response.defer()
@@ -1163,7 +1212,7 @@ async def points_command_error(interaction: discord.Interaction, error):
 
 def points_text(available, held):
     return (f'所持ポイント：**{available+held:,}pt**\n利用可能：{available:,}pt\n'
-            f'ゲーム用預かり：{held:,}pt\n初回500pt・10チャットで1pt・サーバーごとに保存')
+            f'挑戦中（未確定）：{held:,}pt\n初回500pt・10チャットで1pt・サーバーごとに保存')
 
 
 async def handle_points_prefix(message):
@@ -1183,7 +1232,7 @@ async def handle_points_prefix(message):
             game = await asyncio.to_thread(points_store.resume, message.guild.id, message.author.id)
         else:
             if len(parts) not in (2, 3) or any(not re.fullmatch(r'[0-9]{1,7}', part) for part in parts[1:]):
-                raise ValueError('使い方：`!arhl ゲーム数 [1ゲームの賭け額]`（例：`!arhl 10 50`）')
+                raise ValueError('使い方：`!arhl 目標連勝数 [この挑戦への投入額]`（例：`!arhl 10 50`）')
             games = int(parts[1])
             bet = int(parts[2]) if len(parts) == 3 else 0
             game = await asyncio.to_thread(points_store.start, message.guild.id, message.author.id, games, bet)
@@ -1200,5 +1249,6 @@ async def handle_points_prefix(message):
 
 
 client.run(TOKEN)
+
 
 
