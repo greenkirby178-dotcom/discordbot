@@ -98,6 +98,8 @@ async def on_message(message):
         await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
     except sqlite3.Error as error:
         print(f"Chat reward failed: {error}")
+    if await handle_blackjack_prefix(message):
+        return
     if await handle_mines_prefix(message):
         return
     if await handle_points_prefix(message):
@@ -1183,11 +1185,13 @@ async def setup_hook():
     # Fail closed if the persistent disk is missing; never create an ephemeral wallet database.
     if not path.parent.is_dir():
         raise RuntimeError('ポイント保存先がありません。/var/data に永続ディスクを設定してください。')
-    points_store = await asyncio.to_thread(MinesPointsStore, str(path))
+    points_store = await asyncio.to_thread(BlackjackPointsStore, str(path))
     for game in await asyncio.to_thread(points_store.active_games):
         client.add_view(PointsHighLowView(game))
     for game in await asyncio.to_thread(points_store.mines_active):
         client.add_view(MinesView(game))
+    for game in await asyncio.to_thread(points_store.bj_active):
+        client.add_view(BlackjackView(game))
     print(f'Points database ready: {path}', flush=True)
 
 
@@ -1452,7 +1456,7 @@ class MinesPointsStore(PointsStore):
         with self.transaction() as db:
             row = db.execute('SELECT * FROM mines_games WHERE guild_id=? AND user_id=? AND active=1', (guild_id,user_id)).fetchone()
             if row is None:
-                raise ValueError('進行中のマインズがありません。/mines または !armines で開始してください。')
+                raise ValueError('進行中のマインズがありません。/mines または !arm で開始してください。')
             return dict(row)
 
     def mines_start(self, guild_id, user_id, bet, mines):
@@ -1598,7 +1602,7 @@ async def mines_command_error(interaction, error):
 
 async def handle_mines_prefix(message):
     parts = message.content.split()
-    if not parts or parts[0] not in ('!armines', '!arminesresume'):
+    if not parts or parts[0] not in ('!arm', '!arminesresume'):
         return False
     try:
         if parts[0] == '!arminesresume':
@@ -1607,7 +1611,7 @@ async def handle_mines_prefix(message):
             game = await asyncio.to_thread(points_store.mines_resume, message.guild.id, message.author.id)
         else:
             if len(parts) > 3 or any(not re.fullmatch(r'[0-9]{1,7}', p) for p in parts[1:]):
-                raise ValueError('使い方：!armines [投入額] [地雷数]（例：!armines 100 3、省略時は0pt・地雷3個）')
+                raise ValueError('使い方：!arm [投入額] [地雷数]（例：!arm 100 3、省略時は0pt・地雷3個）')
             bet = int(parts[1]) if len(parts) > 1 else 0
             mines = int(parts[2]) if len(parts) > 2 else 3
             game = await asyncio.to_thread(points_store.mines_start, message.guild.id, message.author.id, bet, mines)
@@ -1622,7 +1626,230 @@ async def handle_mines_prefix(message):
     return True
 
 
+
+import json
+
+
+def bj_total(cards):
+    total = sum(min(c % 13 + 1, 10) if c % 13 else 11 for c in cards)
+    aces = sum(c % 13 == 0 for c in cards)
+    while total > 21 and aces:
+        total -= 10
+        aces -= 1
+    return total
+
+
+def bj_cards(cards):
+    return ' '.join('♠♥♦♣'[c // 13] + card_name(c % 13 + 1) for c in cards)
+
+
+class BlackjackPointsStore(MinesPointsStore):
+    def __init__(self, path):
+        super().__init__(path)
+        with self.transaction() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS bj_games (
+                id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                bet INTEGER NOT NULL, pot INTEGER NOT NULL, deck TEXT NOT NULL,
+                player TEXT NOT NULL, dealer TEXT NOT NULL,
+                version INTEGER NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+                result TEXT NOT NULL DEFAULT '')''')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS bj_one_active ON bj_games(guild_id,user_id) WHERE active=1')
+
+    @staticmethod
+    def bj_decode(row):
+        game = dict(row)
+        for key in ('deck', 'player', 'dealer'):
+            game[key] = json.loads(game[key])
+        return game
+
+    def balance(self, guild_id, user_id):
+        with self.transaction() as db:
+            available = self.wallet(db, guild_id, user_id)
+            held = sum(db.execute(f'SELECT COALESCE(SUM(pot),0) FROM {table} WHERE guild_id=? AND user_id=? AND active=1',
+                                 (guild_id,user_id)).fetchone()[0] for table in ('hl_games','mines_games','bj_games'))
+            return available, held
+
+    def ranking(self, guild_id):
+        with self.transaction() as db:
+            return [dict(row) for row in db.execute('''SELECT w.user_id,
+                w.balance+COALESCE(h.pot,0)+COALESCE(m.pot,0)+COALESCE(b.pot,0) AS points
+                FROM wallets w
+                LEFT JOIN hl_games h ON h.guild_id=w.guild_id AND h.user_id=w.user_id AND h.active=1
+                LEFT JOIN mines_games m ON m.guild_id=w.guild_id AND m.user_id=w.user_id AND m.active=1
+                LEFT JOIN bj_games b ON b.guild_id=w.guild_id AND b.user_id=w.user_id AND b.active=1
+                WHERE w.guild_id=? ORDER BY points DESC,w.user_id ASC''', (guild_id,))]
+
+    def bj_active(self):
+        with self.transaction() as db:
+            return [self.bj_decode(r) for r in db.execute('SELECT * FROM bj_games WHERE active=1')]
+
+    def bj_resume(self, guild_id, user_id):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM bj_games WHERE guild_id=? AND user_id=? AND active=1', (guild_id,user_id)).fetchone()
+            if row is None:
+                raise ValueError('進行中のブラックジャックがありません。/blackjack または !arbj で開始してください。')
+            return self.bj_decode(row)
+
+    def bj_save(self, db, game):
+        db.execute('UPDATE bj_games SET deck=?,player=?,dealer=?,version=?,pot=?,active=?,result=? WHERE id=?',
+                   (json.dumps(game['deck']),json.dumps(game['player']),json.dumps(game['dealer']),
+                    game['version'],game['pot'],game['active'],game['result'],game['id']))
+
+    def bj_settle(self, db, game, payout, result):
+        game.update(active=0, pot=payout, result=result)
+        self.change(db, game, payout, 'Blackjack 挑戦精算')
+
+    def bj_start(self, guild_id, user_id, bet):
+        if not 0 <= bet <= 1000000:
+            raise ValueError('投入額は0〜1,000,000ptです。')
+        with self.transaction() as db:
+            balance = self.wallet(db, guild_id,user_id)
+            if db.execute('SELECT 1 FROM bj_games WHERE guild_id=? AND user_id=? AND active=1', (guild_id,user_id)).fetchone():
+                raise ValueError('ブラックジャックが進行中です。/bjresume または !arbjresume で再表示してください。')
+            if balance < bet:
+                raise ValueError(f'ポイントが足りません（利用可能：{balance:,}pt）。')
+            deck = list(range(52))
+            secrets.SystemRandom().shuffle(deck)
+            player = [deck.pop(),deck.pop()]
+            dealer = [deck.pop(),deck.pop()]
+            game = dict(id=uuid.uuid4().hex,guild_id=guild_id,user_id=user_id,bet=bet,pot=bet,
+                        deck=deck,player=player,dealer=dealer,version=0,active=1,result='引くか、止めるか選んでください。')
+            db.execute('INSERT INTO bj_games(id,guild_id,user_id,bet,pot,deck,player,dealer) VALUES (?,?,?,?,?,?,?,?)',
+                       (game['id'],guild_id,user_id,bet,bet,json.dumps(deck),json.dumps(player),json.dumps(dealer)))
+            self.change(db,game,-bet,'Blackjack 挑戦開始')
+            p,d = bj_total(player),bj_total(dealer)
+            if p == 21 or d == 21:
+                if p == d:self.bj_settle(db,game,bet,'引き分け！投入分を返却します。')
+                elif p == 21:self.bj_settle(db,game,bet*5//2,'🎉 ブラックジャック！元手込み2.5倍です。')
+                else:self.bj_settle(db,game,0,'ディーラーがブラックジャック。投入分を失いました。')
+            self.bj_save(db,game)
+            return game
+
+    def bj_answer(self, game_id, user_id, guild_id, version, choice):
+        if choice not in ('hit','stand'):
+            raise ValueError('操作が不正です。')
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM bj_games WHERE id=?', (game_id,)).fetchone()
+            if row is None or row['user_id'] != user_id or row['guild_id'] != guild_id:
+                raise ValueError('開始した本人だけ操作できます。')
+            game = self.bj_decode(row)
+            if not game['active'] or game['version'] != version:
+                raise ValueError('受付済みのボタンです。/bjresume または !arbjresume で再表示してください。')
+            if choice == 'hit':
+                game['player'].append(game['deck'].pop())
+                game['result'] = 'カードを引きました。'
+            p = bj_total(game['player'])
+            if p > 21:
+                self.bj_settle(db,game,0,'💥 21を超えました。投入分を失いました。')
+            elif choice == 'stand' or p == 21:
+                while bj_total(game['dealer']) < 17:
+                    game['dealer'].append(game['deck'].pop())
+                d = bj_total(game['dealer'])
+                if d > 21 or p > d:self.bj_settle(db,game,game['bet']*2,'✅ 勝ち！元手込み2倍です。')
+                elif p == d:self.bj_settle(db,game,game['bet'],'引き分け！投入分を返却します。')
+                else:self.bj_settle(db,game,0,'❌ 負け。投入分を失いました。')
+            game['version'] += 1
+            self.bj_save(db,game)
+            return game
+
+
+def bj_embed(game):
+    embed = discord.Embed(title='🃏 ブラックジャック' if game['active'] else 'ブラックジャック 結果',colour=0x00CC66)
+    embed.description = f"<@{game['user_id']}>｜投入 **{game['bet']:,}pt**\n{game['result']}"
+    embed.add_field(name=f"あなた：{bj_total(game['player'])}",value=bj_cards(game['player']),inline=False)
+    embed.add_field(name='ディーラー' if game['active'] else f"ディーラー：{bj_total(game['dealer'])}",
+                    value=bj_cards(game['dealer'][:1])+' 🂠' if game['active'] else bj_cards(game['dealer']),inline=False)
+    if not game['active']:
+        embed.add_field(name='精算',value=f"受取 **{game['pot']:,}pt**｜収支 **{game['pot']-game['bet']:+,}pt**",inline=False)
+    embed.set_footer(text='A=1/11・絵札=10｜ディーラーはソフト17も停止｜通常2倍・BJ2.5倍（元手込み/端数切捨て）｜引分返却｜分割・ダブルなし｜/bjresumeで再表示')
+    return embed
+
+
+class BlackjackView(discord.ui.View):
+    def __init__(self,game):
+        super().__init__(timeout=None)
+        self.game=game
+        for action,label in [('hit','引く（Hit）'),('stand','止める（Stand）')]:
+            button=discord.ui.Button(label=label,style=discord.ButtonStyle.success if action=='hit' else discord.ButtonStyle.primary,
+                                     custom_id=f"bj:{game['id']}:{game['version']}:{action}",disabled=not game['active'])
+            button.callback=self.answer
+            self.add_item(button)
+
+    async def answer(self,interaction):
+        await interaction.response.defer()
+        try:
+            game=await asyncio.to_thread(points_store.bj_answer,self.game['id'],interaction.user.id,
+                                         interaction.guild_id,self.game['version'],interaction.data['custom_id'].rsplit(':',1)[1])
+        except ValueError as error:
+            await interaction.followup.send(str(error),ephemeral=True)
+            return
+        view=BlackjackView(game)
+        if game['active']:client.add_view(view)
+        await interaction.edit_original_response(embed=bj_embed(game),view=view)
+        self.stop()
+
+    async def on_error(self,interaction,error,item):
+        print(f'Blackjack error: {error}')
+        await interaction.followup.send('表示の更新に失敗しました。/bjresume と /points balance で保存状態を確認してください。',ephemeral=True)
+
+
+async def bj_send(interaction,bet=None):
+    await interaction.response.defer()
+    try:
+        if bet is None:game=await asyncio.to_thread(points_store.bj_resume,interaction.guild_id,interaction.user.id)
+        else:game=await asyncio.to_thread(points_store.bj_start,interaction.guild_id,interaction.user.id,bet)
+        view=BlackjackView(game)
+        if game['active']:client.add_view(view)
+        await interaction.followup.send(embed=bj_embed(game),view=view)
+    except ValueError as error:
+        await interaction.followup.send(str(error),ephemeral=True)
+
+
+@tree.command(name='blackjack',description='引く・止めるボタンでブラックジャックを遊びます')
+@app_commands.guild_only()
+@app_commands.describe(bet='投入ポイント（省略・0なら練習）')
+async def blackjack_command(interaction:discord.Interaction,bet:app_commands.Range[int,0,1000000]=0):
+    await bj_send(interaction,bet)
+
+
+@tree.command(name='bjresume',description='保存されたブラックジャックの続きを表示します')
+@app_commands.guild_only()
+async def bjresume_command(interaction:discord.Interaction):
+    await bj_send(interaction)
+
+
+@blackjack_command.error
+@bjresume_command.error
+async def bj_command_error(interaction,error):
+    print(f'Blackjack command failed: {error}')
+    text='処理または表示に失敗しました。/bjresume と /points balance で保存状態を確認してください。'
+    if interaction.response.is_done():await interaction.followup.send(text,ephemeral=True)
+    else:await interaction.response.send_message(text,ephemeral=True)
+
+
+async def handle_blackjack_prefix(message):
+    parts=message.content.split()
+    if not parts or parts[0] not in ('!arbj','!arbjresume'):return False
+    try:
+        if parts[0]=='!arbjresume':
+            if len(parts)!=1:raise ValueError('使い方：!arbjresume')
+            game=await asyncio.to_thread(points_store.bj_resume,message.guild.id,message.author.id)
+        else:
+            if len(parts)>2 or any(not re.fullmatch(r'[0-9]{1,7}',p) for p in parts[1:]):
+                raise ValueError('使い方：!arbj [投入額]（例：!arbj 100、省略時は練習）')
+            game=await asyncio.to_thread(points_store.bj_start,message.guild.id,message.author.id,int(parts[1]) if len(parts)==2 else 0)
+        view=BlackjackView(game)
+        if game['active']:client.add_view(view)
+        await message.reply(embed=bj_embed(game),view=view,mention_author=False)
+    except ValueError as error:await message.reply(str(error),mention_author=False)
+    except (sqlite3.Error,discord.HTTPException) as error:
+        print(f'Blackjack prefix failed: {error}')
+        await message.reply('処理または表示に失敗しました。!arbjresume と !arp で保存状態を確認してください。',mention_author=False)
+    return True
+
+
 client.run(TOKEN)
+
 
 
 
