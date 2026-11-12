@@ -98,6 +98,8 @@ async def on_message(message):
         await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
     except sqlite3.Error as error:
         print(f"Chat reward failed: {error}")
+    if await handle_bonus_prefix(message):
+        return
     if await handle_blackjack_prefix(message):
         return
     if await handle_mines_prefix(message):
@@ -1185,7 +1187,7 @@ async def setup_hook():
     # Fail closed if the persistent disk is missing; never create an ephemeral wallet database.
     if not path.parent.is_dir():
         raise RuntimeError('ポイント保存先がありません。/var/data に永続ディスクを設定してください。')
-    points_store = await asyncio.to_thread(BlackjackPointsStore, str(path))
+    points_store = await asyncio.to_thread(DailyPointsStore, str(path))
     for game in await asyncio.to_thread(points_store.active_games):
         client.add_view(PointsHighLowView(game))
     for game in await asyncio.to_thread(points_store.mines_active):
@@ -1848,7 +1850,140 @@ async def handle_blackjack_prefix(message):
     return True
 
 
+
+from datetime import datetime, timezone, timedelta
+
+
+DAILY_MISSIONS = (('five_games', 'ミニゲーム合計5回完了', 5, 30),
+                  ('three_types', '3種類のミニゲームを完了', 3, 20))
+DAILY_GAME_REASONS = {'High Low 挑戦精算': 'hl', 'Mines 挑戦精算': 'mines', 'Blackjack 挑戦精算': 'blackjack'}
+
+
+def bonus_day():
+    return datetime.now(timezone(timedelta(hours=9))).date().isoformat()
+
+
+class DailyPointsStore(BlackjackPointsStore):
+    def __init__(self, path):
+        super().__init__(path)
+        with self.transaction() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS daily_completions (
+                game_id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                day TEXT NOT NULL, kind TEXT NOT NULL)''')
+            db.execute('CREATE INDEX IF NOT EXISTS daily_completions_user_day ON daily_completions(guild_id,user_id,day)')
+            db.execute('''CREATE TABLE IF NOT EXISTS daily_claims (
+                guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, day TEXT NOT NULL,
+                reward TEXT NOT NULL, amount INTEGER NOT NULL,
+                PRIMARY KEY(guild_id,user_id,day,reward))''')
+
+    def change(self, db, game, delta, reason):
+        super().change(db, game, delta, reason)
+        kind = DAILY_GAME_REASONS.get(reason)
+        if kind and game.get('bet', 0) > 0:
+            db.execute('INSERT OR IGNORE INTO daily_completions VALUES (?,?,?,?,?)',
+                       (game['id'],game['guild_id'],game['user_id'],bonus_day(),kind))
+
+    def claim_reward(self, db, guild_id, user_id, day, reward, amount):
+        inserted = db.execute('INSERT OR IGNORE INTO daily_claims VALUES (?,?,?,?,?)',
+                              (guild_id,user_id,day,reward,amount)).rowcount
+        if inserted:
+            db.execute('UPDATE wallets SET balance=balance+? WHERE guild_id=? AND user_id=?',
+                       (amount,guild_id,user_id))
+            db.execute('INSERT INTO point_history(guild_id,user_id,delta,reason) VALUES (?,?,?,?)',
+                       (guild_id,user_id,amount,f'Daily bonus {day} {reward}'))
+        return bool(inserted)
+
+    def login_bonus(self, guild_id, user_id):
+        with self.transaction() as db:
+            day = bonus_day()
+            self.wallet(db,guild_id,user_id)
+            received = self.claim_reward(db,guild_id,user_id,day,'login',50)
+            balance = db.execute('SELECT balance FROM wallets WHERE guild_id=? AND user_id=?',
+                                 (guild_id,user_id)).fetchone()[0]
+            return dict(day=day,received=received,balance=balance)
+
+    def daily_bonus(self, guild_id, user_id):
+        with self.transaction() as db:
+            day = bonus_day()
+            self.wallet(db,guild_id,user_id)
+            row = db.execute('SELECT COUNT(*) AS games,COUNT(DISTINCT kind) AS kinds FROM daily_completions '
+                             'WHERE guild_id=? AND user_id=? AND day=?', (guild_id,user_id,day)).fetchone()
+            progress = (row['games'],row['kinds'])
+            missions = []
+            gained = 0
+            for (key,label,target,amount),count in zip(DAILY_MISSIONS,progress):
+                newly = count >= target and self.claim_reward(db,guild_id,user_id,day,key,amount)
+                claimed = db.execute('SELECT 1 FROM daily_claims WHERE guild_id=? AND user_id=? AND day=? AND reward=?',
+                                     (guild_id,user_id,day,key)).fetchone() is not None
+                if newly:gained += amount
+                missions.append(dict(label=label,count=count,target=target,amount=amount,claimed=claimed,newly=bool(newly)))
+            balance = db.execute('SELECT balance FROM wallets WHERE guild_id=? AND user_id=?', (guild_id,user_id)).fetchone()[0]
+            return dict(day=day,gained=gained,missions=missions,balance=balance)
+
+
+def login_bonus_text(result):
+    status = '🎁 ログインボーナス **+50pt** を受け取りました！' if result['received'] else '本日のログインボーナスは受け取り済みです。'
+    return f"{status}\n利用可能：**{result['balance']:,}pt**\n{result['day']}｜日本時間0時更新・サーバーごとに1日1回"
+
+
+def daily_bonus_text(result):
+    lines = [f"**デイリーボーナス｜{result['day']}**"]
+    for m in result['missions']:
+        state = '今回受取' if m['newly'] else '受取済み' if m['claimed'] else '進行中'
+        lines.append(f"{'✅' if m['claimed'] else '▫️'} {m['label']}：{min(m['count'],m['target'])}/{m['target']}｜+{m['amount']}pt（{state}）")
+    lines.extend([f"今回獲得：**+{result['gained']}pt**｜利用可能：**{result['balance']:,}pt**",
+                  'High & Low・マインズ・ブラックジャックが対象。1pt以上を賭け、勝敗を問わず挑戦を終了すると1回。練習は対象外。',
+                  '日本時間0時更新。終了した日で集計し、その日のうちに /daily または !ardl で受け取ってください。'])
+    return '\n'.join(lines)
+
+
+async def send_bonus(interaction, login):
+    await interaction.response.defer(ephemeral=True)
+    method = points_store.login_bonus if login else points_store.daily_bonus
+    result = await asyncio.to_thread(method,interaction.guild_id,interaction.user.id)
+    await interaction.followup.send(login_bonus_text(result) if login else daily_bonus_text(result),ephemeral=True)
+
+
+@tree.command(name='login',description='毎日のログインボーナス50ptを受け取ります')
+@app_commands.guild_only()
+async def login_command(interaction:discord.Interaction):
+    await send_bonus(interaction,True)
+
+
+@tree.command(name='daily',description='デイリーミッションの進捗を確認し達成報酬を受け取ります')
+@app_commands.guild_only()
+async def daily_command(interaction:discord.Interaction):
+    await send_bonus(interaction,False)
+
+
+@login_command.error
+@daily_command.error
+async def bonus_command_error(interaction,error):
+    print(f'Bonus command failed: {error}')
+    text='報酬処理または表示に失敗しました。同じコマンドで再確認してください（二重付与はされません）。'
+    if interaction.response.is_done():await interaction.followup.send(text,ephemeral=True)
+    else:await interaction.response.send_message(text,ephemeral=True)
+
+
+async def handle_bonus_prefix(message):
+    parts=message.content.split()
+    if not parts or parts[0] not in ('!arl','!ardl'):return False
+    try:
+        if len(parts)!=1:
+            await message.reply(f'使い方：{parts[0]}（引数不要）',mention_author=False)
+            return True
+        login=parts[0]=='!arl'
+        method=points_store.login_bonus if login else points_store.daily_bonus
+        result=await asyncio.to_thread(method,message.guild.id,message.author.id)
+        await message.reply(login_bonus_text(result) if login else daily_bonus_text(result),mention_author=False)
+    except (sqlite3.Error,discord.HTTPException) as error:
+        print(f'Bonus prefix failed: {error}')
+        await message.reply('処理または表示に失敗しました。同じコマンドで再確認してください（二重付与はされません）。',mention_author=False)
+    return True
+
+
 client.run(TOKEN)
+
 
 
 
