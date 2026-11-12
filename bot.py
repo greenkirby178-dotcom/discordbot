@@ -98,6 +98,8 @@ async def on_message(message):
         await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
     except sqlite3.Error as error:
         print(f"Chat reward failed: {error}")
+    if await handle_mines_prefix(message):
+        return
     if await handle_points_prefix(message):
         return
     await handle_arc(message)
@@ -1181,9 +1183,11 @@ async def setup_hook():
     # Fail closed if the persistent disk is missing; never create an ephemeral wallet database.
     if not path.parent.is_dir():
         raise RuntimeError('ポイント保存先がありません。/var/data に永続ディスクを設定してください。')
-    points_store = await asyncio.to_thread(PointsStore, str(path))
+    points_store = await asyncio.to_thread(MinesPointsStore, str(path))
     for game in await asyncio.to_thread(points_store.active_games):
         client.add_view(PointsHighLowView(game))
+    for game in await asyncio.to_thread(points_store.mines_active):
+        client.add_view(MinesView(game))
     print(f'Points database ready: {path}', flush=True)
 
 
@@ -1402,7 +1406,224 @@ async def handle_points_prefix(message):
     return True
 
 
+
+import math
+import secrets
+
+
+def mines_payout(bet, mines, opened):
+    if opened == 0:
+        return bet
+    return min(MAX_HL_POT, bet * 95 * math.comb(16, opened) // (100 * math.comb(16-mines, opened)))
+
+
+class MinesPointsStore(PointsStore):
+    def __init__(self, path):
+        super().__init__(path)
+        with self.transaction() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS mines_games (
+                id TEXT PRIMARY KEY, guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                bet INTEGER NOT NULL, mines INTEGER NOT NULL, board INTEGER NOT NULL,
+                opened INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0,
+                pot INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 1,
+                result TEXT NOT NULL DEFAULT '')''')
+            db.execute('CREATE UNIQUE INDEX IF NOT EXISTS mines_one_active ON mines_games(guild_id,user_id) WHERE active=1')
+
+    def balance(self, guild_id, user_id):
+        with self.transaction() as db:
+            available = self.wallet(db, guild_id, user_id)
+            held = sum(db.execute(f'SELECT COALESCE(SUM(pot),0) FROM {table} WHERE guild_id=? AND user_id=? AND active=1',
+                                 (guild_id, user_id)).fetchone()[0] for table in ('hl_games', 'mines_games'))
+            return available, held
+
+    def ranking(self, guild_id):
+        with self.transaction() as db:
+            return [dict(row) for row in db.execute('''
+                SELECT w.user_id, w.balance + COALESCE(h.pot,0) + COALESCE(m.pot,0) AS points
+                FROM wallets w LEFT JOIN hl_games h ON h.guild_id=w.guild_id AND h.user_id=w.user_id AND h.active=1
+                LEFT JOIN mines_games m ON m.guild_id=w.guild_id AND m.user_id=w.user_id AND m.active=1
+                WHERE w.guild_id=? ORDER BY points DESC,w.user_id ASC''', (guild_id,))]
+
+    def mines_active(self):
+        with self.transaction() as db:
+            return [dict(r) for r in db.execute('SELECT * FROM mines_games WHERE active=1')]
+
+    def mines_resume(self, guild_id, user_id):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM mines_games WHERE guild_id=? AND user_id=? AND active=1', (guild_id,user_id)).fetchone()
+            if row is None:
+                raise ValueError('進行中のマインズがありません。/mines または !armines で開始してください。')
+            return dict(row)
+
+    def mines_start(self, guild_id, user_id, bet, mines):
+        if not 0 <= bet <= 1000000 or not 1 <= mines <= 15:
+            raise ValueError('投入額は0〜1,000,000pt、地雷数は1〜15個です。')
+        with self.transaction() as db:
+            balance = self.wallet(db, guild_id, user_id)
+            if db.execute('SELECT 1 FROM mines_games WHERE guild_id=? AND user_id=? AND active=1', (guild_id,user_id)).fetchone():
+                raise ValueError('マインズが進行中です。/minesresume または !arminesresume で再表示してください。')
+            if balance < bet:
+                raise ValueError(f'ポイントが足りません（利用可能：{balance:,}pt）。')
+            game = dict(id=uuid.uuid4().hex, guild_id=guild_id, user_id=user_id)
+            board = sum(1 << n for n in secrets.SystemRandom().sample(range(16), mines))
+            db.execute('INSERT INTO mines_games(id,guild_id,user_id,bet,mines,board,pot) VALUES (?,?,?,?,?,?,?)',
+                       (game['id'],guild_id,user_id,bet,mines,board,bet))
+            self.change(db, game, -bet, 'Mines 挑戦開始')
+            return dict(db.execute('SELECT * FROM mines_games WHERE id=?', (game['id'],)).fetchone())
+
+    def mines_answer(self, game_id, user_id, guild_id, version, choice):
+        with self.transaction() as db:
+            row = db.execute('SELECT * FROM mines_games WHERE id=?', (game_id,)).fetchone()
+            if row is None or row['user_id'] != user_id or row['guild_id'] != guild_id:
+                raise ValueError('開始した本人だけ操作できます。')
+            game = dict(row)
+            if not game['active'] or game['version'] != version:
+                raise ValueError('受付済みのボタンです。/minesresume または !arminesresume で再表示してください。')
+            count = game['opened'].bit_count()
+            if choice == 'stop':
+                if count == 0:
+                    raise ValueError('1マス成功後から確定できます。')
+                game['active'] = 0
+                game['result'] = '確定して終了しました。'
+            else:
+                if not isinstance(choice, int) or not 0 <= choice < 16:
+                    raise ValueError('マスが不正です。')
+                bit = 1 << choice
+                if game['opened'] & bit:
+                    raise ValueError('そのマスは開いています。')
+                game['opened'] |= bit
+                if game['board'] & bit:
+                    game.update(pot=0, active=0, result='💥 地雷！投入分と途中の獲得分を全ロストしました。')
+                else:
+                    game['pot'] = mines_payout(game['bet'], game['mines'], count+1)
+                    game['result'] = '💎 セーフ！続けるか、確定するか選べます。'
+                    if count+1 == 16-game['mines'] or game['pot'] == MAX_HL_POT:
+                        game.update(active=0, result='🎉 クリア！自動確定しました。')
+            game['version'] += 1
+            if not game['active']:
+                self.change(db, game, game['pot'], 'Mines 挑戦精算')
+            db.execute('UPDATE mines_games SET opened=?,version=?,pot=?,active=?,result=? WHERE id=?',
+                       (game['opened'],game['version'],game['pot'],game['active'],game['result'],game_id))
+            return game
+
+
+def mines_embed(game):
+    count = (game['opened'] & ~game['board']).bit_count()
+    embed = discord.Embed(title='💎 マインズ' if game['active'] else 'マインズ 結果', colour=0x00CC66)
+    embed.description = (f"<@{game['user_id']}>｜投入 **{game['bet']:,}pt**｜地雷 **{game['mines']}個**\n"
+                         f"成功 **{count}/{16-game['mines']}マス**｜現在 **{game['pot']:,}pt**\n"
+                         f"収支（進行中は未確定）：**{game['pot']-game['bet']:+,}pt**\n{game['result']}")
+    if game['active']:
+        embed.add_field(name='次の1マス', value=f"成功確率 {16-game['mines']-count}/{16-count}・成功時 **{mines_payout(game['bet'],game['mines'],count+1):,}pt**（元手込み）\n1マス成功後から確定可能。地雷で挑戦分は全ロスト。", inline=False)
+    embed.set_footer(text='4×4｜期待払戻率95%・端数切捨て｜0ptは練習｜上限1兆pt｜/minesresumeで再表示')
+    return embed
+
+
+class MinesView(discord.ui.View):
+    def __init__(self, game):
+        super().__init__(timeout=None)
+        self.game = game
+        for index in range(16):
+            opened = bool(game['opened'] & (1 << index))
+            revealed = opened or not game['active']
+            label = ('💣' if game['board'] & (1 << index) else '💎') if revealed else str(index+1)
+            button = discord.ui.Button(label=label, row=index//4,
+                style=discord.ButtonStyle.success if opened and not game['board'] & (1 << index) else discord.ButtonStyle.secondary,
+                disabled=opened or not game['active'], custom_id=f"mines:{game['id']}:{game['version']}:{index}")
+            button.callback = self.answer
+            self.add_item(button)
+        button = discord.ui.Button(label='確定して終了', row=4, style=discord.ButtonStyle.primary,
+            disabled=not game['active'] or not game['opened'], custom_id=f"mines:{game['id']}:{game['version']}:stop")
+        button.callback = self.answer
+        self.add_item(button)
+
+    async def answer(self, interaction):
+        await interaction.response.defer()
+        raw = interaction.data['custom_id'].rsplit(':',1)[1]
+        try:
+            game = await asyncio.to_thread(points_store.mines_answer, self.game['id'], interaction.user.id,
+                                           interaction.guild_id, self.game['version'], 'stop' if raw == 'stop' else int(raw))
+        except ValueError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
+            return
+        view = MinesView(game)
+        if game['active']:
+            client.add_view(view)
+        await interaction.edit_original_response(embed=mines_embed(game), view=view)
+        self.stop()
+
+    async def on_error(self, interaction, error, item):
+        print(f'Mines error: {type(error).__name__}: {error}')
+        await interaction.followup.send('表示の更新に失敗しました。/minesresume と /points balance で保存状態を確認してください。', ephemeral=True)
+
+
+@tree.command(name='mines', description='地雷を避けてマスを開くポイントゲーム')
+@app_commands.guild_only()
+@app_commands.describe(bet='投入ポイント（省略・0なら練習）', mines='地雷の数（1〜15、標準3）')
+async def mines_command(interaction: discord.Interaction, bet: app_commands.Range[int,0,1000000]=0,
+                        mines: app_commands.Range[int,1,15]=3):
+    await interaction.response.defer()
+    try:
+        game = await asyncio.to_thread(points_store.mines_start, interaction.guild_id, interaction.user.id, bet, mines)
+        view = MinesView(game)
+        client.add_view(view)
+        await interaction.followup.send(embed=mines_embed(game), view=view)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+
+
+@tree.command(name='minesresume', description='保存されたマインズの続きを表示します')
+@app_commands.guild_only()
+async def mines_resume_command(interaction: discord.Interaction):
+    await interaction.response.defer()
+    try:
+        game = await asyncio.to_thread(points_store.mines_resume, interaction.guild_id, interaction.user.id)
+        view = MinesView(game)
+        client.add_view(view)
+        await interaction.followup.send(embed=mines_embed(game), view=view)
+    except ValueError as error:
+        await interaction.followup.send(str(error), ephemeral=True)
+
+
+@mines_command.error
+@mines_resume_command.error
+async def mines_command_error(interaction, error):
+    print(f'Mines command failed: {error}')
+    text = '処理または表示に失敗しました。/minesresume と /points balance で保存状態を確認してください。'
+    if interaction.response.is_done():
+        await interaction.followup.send(text, ephemeral=True)
+    else:
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+async def handle_mines_prefix(message):
+    parts = message.content.split()
+    if not parts or parts[0] not in ('!armines', '!arminesresume'):
+        return False
+    try:
+        if parts[0] == '!arminesresume':
+            if len(parts) != 1:
+                raise ValueError('使い方：!arminesresume')
+            game = await asyncio.to_thread(points_store.mines_resume, message.guild.id, message.author.id)
+        else:
+            if len(parts) > 3 or any(not re.fullmatch(r'[0-9]{1,7}', p) for p in parts[1:]):
+                raise ValueError('使い方：!armines [投入額] [地雷数]（例：!armines 100 3、省略時は0pt・地雷3個）')
+            bet = int(parts[1]) if len(parts) > 1 else 0
+            mines = int(parts[2]) if len(parts) > 2 else 3
+            game = await asyncio.to_thread(points_store.mines_start, message.guild.id, message.author.id, bet, mines)
+        view = MinesView(game)
+        client.add_view(view)
+        await message.reply(embed=mines_embed(game), view=view, mention_author=False)
+    except ValueError as error:
+        await message.reply(str(error), mention_author=False)
+    except (sqlite3.Error, discord.HTTPException) as error:
+        print(f'Mines prefix failed: {error}')
+        await message.reply('処理または表示に失敗しました。!arminesresume と !arp で保存状態を確認してください。', mention_author=False)
+    return True
+
+
 client.run(TOKEN)
+
 
 
 
