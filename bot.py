@@ -1323,7 +1323,7 @@ async def hlresume(interaction: discord.Interaction):
     await interaction.followup.send(embed=points_game_embed(game), view=view)
 
 
-@tree.command(name='winrate', description='High Lowの勝率と累計収支を表示します')
+@tree.command(name='winrate', description='ミニゲーム別の勝率と累計収支を表示します')
 @app_commands.guild_only()
 async def winrate(interaction: discord.Interaction):
     await interaction.response.defer()
@@ -1348,14 +1348,15 @@ async def points_command_error(interaction: discord.Interaction, error):
 
 
 def winrate_text(mention, stats):
-    rounds = stats['rounds']
-    rate = f"{stats['wins'] / rounds * 100:.2f}%" if rounds else '記録なし'
-    return (f"**{mention} のHigh & Low成績**\n"
-            f"勝率：**{rate}**（{stats['wins']}勝 {rounds-stats['wins']}敗）\n"
-            f"累計収支：**{stats['profit']:+,}pt**\n"
-            f"終了した挑戦：{stats['challenges']}回・回答：{rounds}回\n"
-            "集計対象：ポイントリセット後、このサーバーで終了したポイントを賭けた挑戦。\n"
-            "勝率はHigh／Lowの回答ごと、収支は受取額−投入額です。")
+    lines = [f"**{mention} のミニゲーム成績**", f"合計収支：**{sum(r['profit'] for r in stats):+,}pt**"]
+    for row in stats:
+        count = row['challenges']
+        rate = f"{row['wins']/count*100:.2f}%" if count else '記録なし'
+        lines.append(f"\n**{row['label']}**\n勝率：{rate}（{row['wins']}勝 {row['losses']}敗 {row['draws']}分）"
+                     f"\n収支：**{row['profit']:+,}pt**｜終了した挑戦：{count}回")
+    lines.append('\n勝＝受取額が投入額より多い、敗＝少ない、分＝同額。勝率は勝ち÷全挑戦（引分含む）。'
+                 '\nこのサーバーで終了した賭けありの挑戦を集計。練習・進行中・リセットで終了した挑戦は除外。ボーナスは収支に含みません。')
+    return '\n'.join(lines)
 
 
 def points_text(available, held):
@@ -1693,9 +1694,9 @@ class BlackjackPointsStore(MinesPointsStore):
             return self.bj_decode(row)
 
     def bj_save(self, db, game):
-        db.execute('UPDATE bj_games SET deck=?,player=?,dealer=?,version=?,pot=?,active=?,result=? WHERE id=?',
+        db.execute('UPDATE bj_games SET deck=?,player=?,dealer=?,version=?,pot=?,active=?,result=?,bet=? WHERE id=?',
                    (json.dumps(game['deck']),json.dumps(game['player']),json.dumps(game['dealer']),
-                    game['version'],game['pot'],game['active'],game['result'],game['id']))
+                    game['version'],game['pot'],game['active'],game['result'],game['bet'],game['id']))
 
     def bj_settle(self, db, game, payout, result):
         game.update(active=0, pot=payout, result=result)
@@ -1728,7 +1729,7 @@ class BlackjackPointsStore(MinesPointsStore):
             return game
 
     def bj_answer(self, game_id, user_id, guild_id, version, choice):
-        if choice not in ('hit','stand'):
+        if choice not in ('hit','stand','double'):
             raise ValueError('操作が不正です。')
         with self.transaction() as db:
             row = db.execute('SELECT * FROM bj_games WHERE id=?', (game_id,)).fetchone()
@@ -1737,19 +1738,31 @@ class BlackjackPointsStore(MinesPointsStore):
             game = self.bj_decode(row)
             if not game['active'] or game['version'] != version:
                 raise ValueError('受付済みのボタンです。/bjresume または !arbjresume で再表示してください。')
-            if choice == 'hit':
+            if choice == 'double':
+                if len(game['player']) != 2 or game['version'] != 0:
+                    raise ValueError('ダブルダウンは最初の2枚のときだけ可能です。')
+                balance = self.wallet(db, guild_id, user_id)
+                extra = game['bet']
+                if balance < extra:
+                    raise ValueError(f'追加で{extra:,}pt必要です（利用可能：{balance:,}pt）。')
+                self.change(db, game, -extra, 'Blackjack ダブルダウン追加投入')
+                game['bet'] += extra
+                game['pot'] = game['bet']
+            if choice in ('hit', 'double'):
                 game['player'].append(game['deck'].pop())
                 game['result'] = 'カードを引きました。'
             p = bj_total(game['player'])
             if p > 21:
                 self.bj_settle(db,game,0,'💥 21を超えました。投入分を失いました。')
-            elif choice == 'stand' or p == 21:
+            elif choice in ('stand','double') or p == 21:
                 while bj_total(game['dealer']) < 17:
                     game['dealer'].append(game['deck'].pop())
                 d = bj_total(game['dealer'])
                 if d > 21 or p > d:self.bj_settle(db,game,game['bet']*2,'✅ 勝ち！元手込み2倍です。')
                 elif p == d:self.bj_settle(db,game,game['bet'],'引き分け！投入分を返却します。')
                 else:self.bj_settle(db,game,0,'❌ 負け。投入分を失いました。')
+            if choice == 'double':
+                game['result'] = 'ダブルダウン（投入額2倍・1枚で勝負）\n' + game['result']
             game['version'] += 1
             self.bj_save(db,game)
             return game
@@ -1761,9 +1774,11 @@ def bj_embed(game):
     embed.add_field(name=f"あなた：{bj_total(game['player'])}",value=bj_cards(game['player']),inline=False)
     embed.add_field(name='ディーラー' if game['active'] else f"ディーラー：{bj_total(game['dealer'])}",
                     value=bj_cards(game['dealer'][:1])+' 🂠' if game['active'] else bj_cards(game['dealer']),inline=False)
+    if game['active'] and len(game['player']) == 2:
+        embed.add_field(name='ダブルダウン',value=f"追加{game['bet']:,}ptで投入額を2倍にし、1枚だけ引いて勝負します。",inline=False)
     if not game['active']:
         embed.add_field(name='精算',value=f"受取 **{game['pot']:,}pt**｜収支 **{game['pot']-game['bet']:+,}pt**",inline=False)
-    embed.set_footer(text='A=1/11・絵札=10｜ディーラーはソフト17も停止｜通常2倍・BJ2.5倍（元手込み/端数切捨て）｜引分返却｜分割・ダブルなし｜/bjresumeで再表示')
+    embed.set_footer(text='A=1/11・絵札=10｜ディーラーはソフト17も停止｜通常2倍・BJ2.5倍（元手込み/端数切捨て）｜引分返却｜最初の2枚でダブル可・分割なし｜/bjresumeで再表示')
     return embed
 
 
@@ -1771,9 +1786,9 @@ class BlackjackView(discord.ui.View):
     def __init__(self,game):
         super().__init__(timeout=None)
         self.game=game
-        for action,label in [('hit','引く（Hit）'),('stand','止める（Stand）')]:
+        for action,label in [('hit','引く（Hit）'),('stand','止める（Stand）'),('double','ダブルダウン')]:
             button=discord.ui.Button(label=label,style=discord.ButtonStyle.success if action=='hit' else discord.ButtonStyle.primary,
-                                     custom_id=f"bj:{game['id']}:{game['version']}:{action}",disabled=not game['active'])
+                                     custom_id=f"bj:{game['id']}:{game['version']}:{action}",disabled=not game['active'] or (action == 'double' and (len(game['player']) != 2 or game['version'] != 0)))
             button.callback=self.answer
             self.add_item(button)
 
@@ -1875,6 +1890,23 @@ class DailyPointsStore(BlackjackPointsStore):
                 guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL, day TEXT NOT NULL,
                 reward TEXT NOT NULL, amount INTEGER NOT NULL,
                 PRIMARY KEY(guild_id,user_id,day,reward))''')
+
+    def winrate(self, guild_id, user_id):
+        with self.transaction() as db:
+            rows = []
+            for table, label, reason in [('hl_games','High & Low','High Low 挑戦開始'),
+                                         ('mines_games','マインズ','Mines 挑戦開始'),
+                                         ('bj_games','ブラックジャック','Blackjack 挑戦開始')]:
+                row = dict(db.execute(f"""SELECT COUNT(*) AS challenges,
+                    COALESCE(SUM(pot>bet),0) AS wins,COALESCE(SUM(pot<bet),0) AS losses,
+                    COALESCE(SUM(pot=bet),0) AS draws,COALESCE(SUM(pot-bet),0) AS profit
+                    FROM {table} g WHERE guild_id=? AND user_id=? AND active=0 AND bet>0
+                    AND result != 'ポイントリセットにより終了しました。'
+                    AND EXISTS (SELECT 1 FROM point_history h WHERE h.game_id=g.id AND h.reason=?)""",
+                    (guild_id,user_id,reason)).fetchone())
+                row['label'] = label
+                rows.append(row)
+            return rows
 
     def change(self, db, game, delta, reason):
         super().change(db, game, delta, reason)
@@ -1983,6 +2015,7 @@ async def handle_bonus_prefix(message):
 
 
 client.run(TOKEN)
+
 
 
 
