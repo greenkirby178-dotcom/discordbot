@@ -1138,7 +1138,8 @@ def points_game_embed(game):
             embed.add_field(name=label, value=value, inline=False)
     if game['result']:
         embed.add_field(name='直前の結果', value=game['result'], inline=False)
-    embed.set_footer(text='期待払戻率95%・端数切捨て｜A=1/K=13・同数再抽選｜上限1兆ptで自動確定｜/hlresumeで再開')
+    embed.set_footer(text='基本配当95%・端数切捨て（イベント別）｜A=1/K=13・同数再抽選｜基本配当1兆ptで自動確定｜/hlresumeで再開')
+    embed.add_field(name='配当イベント',value=PAYOUT_EVENT_TEXT,inline=False)
     return embed
 
 
@@ -1522,7 +1523,8 @@ def mines_embed(game):
                          f"収支（進行中は未確定）：**{game['pot']-game['bet']:+,}pt**\n{game['result']}")
     if game['active']:
         embed.add_field(name='次の1マス', value=f"成功確率 {16-game['mines']-count}/{16-count}・成功時 **{mines_payout(game['bet'],game['mines'],count+1):,}pt**（元手込み）\n1マス成功後から確定可能。地雷で挑戦分は全ロスト。", inline=False)
-    embed.set_footer(text='4×4｜期待払戻率95%・端数切捨て｜0ptは練習｜上限1兆pt｜/minesresumeで再表示')
+    embed.set_footer(text='4×4｜基本配当95%・端数切捨て（イベント別）｜0ptは練習｜基本配当上限1兆pt｜/minesresumeで再表示')
+    embed.add_field(name='配当イベント',value=PAYOUT_EVENT_TEXT,inline=False)
     return embed
 
 
@@ -1779,6 +1781,7 @@ def bj_embed(game):
     if not game['active']:
         embed.add_field(name='精算',value=f"受取 **{game['pot']:,}pt**｜収支 **{game['pot']-game['bet']:+,}pt**",inline=False)
     embed.set_footer(text='A=1/11・絵札=10｜ディーラーはソフト17も停止｜通常2倍・BJ2.5倍（元手込み/端数切捨て）｜引分返却｜最初の2枚でダブル可・分割なし｜/bjresumeで再表示')
+    embed.add_field(name='配当イベント',value=PAYOUT_EVENT_TEXT,inline=False)
     return embed
 
 
@@ -1874,6 +1877,20 @@ DAILY_MISSIONS = (('five_games', 'ミニゲーム合計5回完了', 5, 30),
 DAILY_GAME_REASONS = {'High Low 挑戦精算': 'hl', 'Mines 挑戦精算': 'mines', 'Blackjack 挑戦精算': 'blackjack'}
 
 
+PAYOUT_EVENT_TEXT = '精算時抽選：5%で2倍・1%で3倍・0.1%で5倍（重複なし／元手込み／練習・0pt除外）'
+
+
+def payout_event_multiplier():
+    roll = secrets.randbelow(1000)
+    if roll < 1:
+        return 5
+    if roll < 11:
+        return 3
+    if roll < 61:
+        return 2
+    return 1
+
+
 def bonus_day():
     return datetime.now(timezone(timedelta(hours=9))).date().isoformat()
 
@@ -1909,8 +1926,17 @@ class DailyPointsStore(BlackjackPointsStore):
             return rows
 
     def change(self, db, game, delta, reason):
-        super().change(db, game, delta, reason)
         kind = DAILY_GAME_REASONS.get(reason)
+        # Settlement, bonus, saved payout and mission completion share one transaction.
+        # Active/version checks in each game reject retries before this draw is reached.
+        if kind and game.get('bet', 0) > 0 and delta > 0:
+            multiplier = payout_event_multiplier()
+            base = delta
+            delta *= multiplier
+            game['pot'] = delta
+            game['result'] += (f'\n🎁 配当イベント {multiplier}倍！通常{base:,}pt → 最終受取{delta:,}pt'
+                               if multiplier > 1 else f'\n配当イベント：通常倍率（最終受取{delta:,}pt）')
+        super().change(db, game, delta, reason)
         if kind and game.get('bet', 0) > 0:
             db.execute('INSERT OR IGNORE INTO daily_completions VALUES (?,?,?,?,?)',
                        (game['id'],game['guild_id'],game['user_id'],bonus_day(),kind))
@@ -2015,6 +2041,7 @@ async def handle_bonus_prefix(message):
 
 
 client.run(TOKEN)
+
 
 
 
