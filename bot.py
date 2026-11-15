@@ -1877,7 +1877,7 @@ DAILY_MISSIONS = (('five_games', 'ミニゲーム合計5回完了', 5, 30),
 DAILY_GAME_REASONS = {'High Low 挑戦精算': 'hl', 'Mines 挑戦精算': 'mines', 'Blackjack 挑戦精算': 'blackjack'}
 
 
-PAYOUT_EVENT_TEXT = '精算時抽選：5%で2倍・1%で3倍・0.1%で5倍（重複なし／元手込み／練習・0pt除外）'
+PAYOUT_EVENT_TEXT = '精算時抽選：5%で2倍・1%で3倍・0.1%で5倍（重複なし／元手込み／練習・0pt・BJ引分除外）'
 
 
 def payout_event_multiplier():
@@ -1929,7 +1929,8 @@ class DailyPointsStore(BlackjackPointsStore):
         kind = DAILY_GAME_REASONS.get(reason)
         # Settlement, bonus, saved payout and mission completion share one transaction.
         # Active/version checks in each game reject retries before this draw is reached.
-        if kind and game.get('bet', 0) > 0 and delta > 0:
+        if (kind and game.get('bet', 0) > 0 and delta > 0
+                and not (kind == 'blackjack' and delta == game['bet'])):
             multiplier = payout_event_multiplier()
             base = delta
             delta *= multiplier
