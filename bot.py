@@ -98,6 +98,8 @@ async def on_message(message):
         await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
     except sqlite3.Error as error:
         print(f"Chat reward failed: {error}")
+    if await handle_roulette_prefix(message):
+        return
     if await handle_bonus_prefix(message):
         return
     if await handle_blackjack_prefix(message):
@@ -1188,7 +1190,7 @@ async def setup_hook():
     # Fail closed if the persistent disk is missing; never create an ephemeral wallet database.
     if not path.parent.is_dir():
         raise RuntimeError('ポイント保存先がありません。/var/data に永続ディスクを設定してください。')
-    points_store = await asyncio.to_thread(DailyPointsStore, str(path))
+    points_store = await asyncio.to_thread(RoulettePointsStore, str(path))
     for game in await asyncio.to_thread(points_store.active_games):
         client.add_view(PointsHighLowView(game))
     for game in await asyncio.to_thread(points_store.mines_active):
@@ -1873,8 +1875,8 @@ from datetime import datetime, timezone, timedelta
 
 
 DAILY_MISSIONS = (('five_games', 'ミニゲーム合計5回完了', 5, 30),
-                  ('three_types', '3種類のミニゲームを完了', 3, 20))
-DAILY_GAME_REASONS = {'High Low 挑戦精算': 'hl', 'Mines 挑戦精算': 'mines', 'Blackjack 挑戦精算': 'blackjack'}
+                  ('three_types', '4種類のうち3種類のミニゲームを完了', 3, 20))
+DAILY_GAME_REASONS = {'High Low 挑戦精算': 'hl', 'Mines 挑戦精算': 'mines', 'Blackjack 挑戦精算': 'blackjack', 'Roulette 挑戦精算': 'roulette'}
 
 
 PAYOUT_EVENT_TEXT = '精算時抽選：5%で2倍・1%で3倍・0.1%で5倍（重複なし／元手込み／練習・0pt・BJ引分除外）'
@@ -1913,7 +1915,8 @@ class DailyPointsStore(BlackjackPointsStore):
             rows = []
             for table, label, reason in [('hl_games','High & Low','High Low 挑戦開始'),
                                          ('mines_games','マインズ','Mines 挑戦開始'),
-                                         ('bj_games','ブラックジャック','Blackjack 挑戦開始')]:
+                                         ('bj_games','ブラックジャック','Blackjack 挑戦開始'),
+                                         ('roulette_games','ルーレット','Roulette 挑戦開始')]:
                 row = dict(db.execute(f"""SELECT COUNT(*) AS challenges,
                     COALESCE(SUM(pot>bet),0) AS wins,COALESCE(SUM(pot<bet),0) AS losses,
                     COALESCE(SUM(pot=bet),0) AS draws,COALESCE(SUM(pot-bet),0) AS profit
@@ -1991,7 +1994,7 @@ def daily_bonus_text(result):
         state = '今回受取' if m['newly'] else '受取済み' if m['claimed'] else '進行中'
         lines.append(f"{'✅' if m['claimed'] else '▫️'} {m['label']}：{min(m['count'],m['target'])}/{m['target']}｜+{m['amount']}pt（{state}）")
     lines.extend([f"今回獲得：**+{result['gained']}pt**｜利用可能：**{result['balance']:,}pt**",
-                  'High & Low・マインズ・ブラックジャックが対象。1pt以上を賭け、勝敗を問わず挑戦を終了すると1回。練習は対象外。',
+                  'High & Low・マインズ・ブラックジャック・ルーレットが対象。1pt以上を賭け、勝敗を問わず挑戦を終了すると1回。練習は対象外。',
                   '日本時間0時更新。終了した日で集計し、その日のうちに /daily または !ardl で受け取ってください。'])
     return '\n'.join(lines)
 
@@ -2041,7 +2044,119 @@ async def handle_bonus_prefix(message):
     return True
 
 
+
+ROULETTE_RED = frozenset((1,3,5,7,9,12,14,16,18,19,21,23,25,27,30,32,34,36))
+ROULETTE_LABELS = {'red':'赤','black':'黒','odd':'奇数','even':'偶数','number':'数字1点'}
+
+
+def roulette_wins(number, choice, target=None):
+    if choice == 'number':return number == target
+    if number == 0:return False
+    return {'red':number in ROULETTE_RED,'black':number not in ROULETTE_RED,
+            'odd':number % 2 == 1,'even':number % 2 == 0}[choice]
+
+
+class RoulettePointsStore(DailyPointsStore):
+    def __init__(self,path):
+        super().__init__(path)
+        with self.transaction() as db:
+            db.execute('''CREATE TABLE IF NOT EXISTS roulette_games (
+                id TEXT PRIMARY KEY, request_id TEXT UNIQUE NOT NULL,
+                guild_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
+                bet INTEGER NOT NULL, pot INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
+                choice TEXT NOT NULL, target INTEGER, number INTEGER NOT NULL, result TEXT NOT NULL)''')
+
+    def roulette(self,guild_id,user_id,request_id,bet,choice,target=None):
+        if not isinstance(bet,int) or not 0 <= bet <= 1000000:
+            raise ValueError('投入額は0〜1,000,000ptで指定してください。')
+        if choice not in ROULETTE_LABELS:
+            raise ValueError('赤・黒・奇数・偶数・数字1点から選んでください。')
+        if choice == 'number':
+            if not isinstance(target,int) or not 0 <= target <= 36:
+                raise ValueError('数字1点ではnumberに0〜36を指定してください。')
+        elif target is not None:
+            raise ValueError('numberは「数字1点」のときだけ指定できます。')
+        with self.transaction() as db:
+            previous = db.execute('SELECT * FROM roulette_games WHERE request_id=?',(str(request_id),)).fetchone()
+            if previous:
+                if previous['guild_id'] != guild_id or previous['user_id'] != user_id:
+                    raise ValueError('この結果は別のプレイヤーのものです。')
+                return dict(previous)
+            balance = self.wallet(db,guild_id,user_id)
+            if balance < bet:
+                raise ValueError(f'ポイントが足りません（利用可能：{balance:,}pt）。')
+            number = secrets.randbelow(37)
+            won = roulette_wins(number,choice,target)
+            payout = bet * (36 if choice == 'number' else 2) if won else 0
+            game = dict(id=uuid.uuid4().hex,request_id=str(request_id),guild_id=guild_id,user_id=user_id,
+                        bet=bet,pot=payout,active=0,choice=choice,target=target,number=number,
+                        result='✅ 的中！' if won else '❌ はずれ。投入分を失いました。')
+            self.change(db,game,-bet,'Roulette 挑戦開始')
+            self.change(db,game,payout,'Roulette 挑戦精算')
+            db.execute('INSERT INTO roulette_games VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                       (game['id'],game['request_id'],guild_id,user_id,bet,game['pot'],0,choice,target,number,game['result']))
+            return game
+
+
+def roulette_embed(game):
+    number=game['number']
+    color='🟢 緑' if number==0 else '🔴 赤' if number in ROULETTE_RED else '⚫ 黒'
+    choice=str(game['target'])+'番' if game['choice']=='number' else ROULETTE_LABELS[game['choice']]
+    embed=discord.Embed(title=f'🎰 ルーレット結果：{number}（{color}）',colour=0x00CC66)
+    embed.description=(f"<@{game['user_id']}>｜賭け先：**{choice}**｜投入 **{game['bet']:,}pt**\n"
+                       f"{game['result']}\n受取 **{game['pot']:,}pt**｜収支 **{game['pot']-game['bet']:+,}pt**")
+    embed.add_field(name='配当イベント',value=PAYOUT_EVENT_TEXT,inline=False)
+    embed.set_footer(text='0〜36の37通り｜赤黒・偶奇2倍／数字1点36倍（元手込み）｜0は緑・赤黒偶奇は外れ｜0ptは練習')
+    return embed
+
+
+@tree.command(name='roulette',description='赤黒・偶奇・数字を選んでルーレットを回します')
+@app_commands.guild_only()
+@app_commands.describe(choice='賭け先',bet='投入ポイント（省略・0なら練習）',number='数字1点を選んだ場合の番号（0〜36）')
+@app_commands.choices(choice=[app_commands.Choice(name=label,value=value) for value,label in ROULETTE_LABELS.items()])
+async def roulette_command(interaction:discord.Interaction,choice:str,bet:app_commands.Range[int,0,1000000]=0,
+                           number:app_commands.Range[int,0,36]|None=None):
+    await interaction.response.defer()
+    try:
+        game=await asyncio.to_thread(points_store.roulette,interaction.guild_id,interaction.user.id,interaction.id,bet,choice,number)
+        await interaction.followup.send(embed=roulette_embed(game))
+    except ValueError as error:
+        await interaction.followup.send(str(error),ephemeral=True)
+
+
+@roulette_command.error
+async def roulette_error(interaction,error):
+    print(f'Roulette command failed: {error}')
+    text='処理または表示に失敗しました。/points balance と /winrate で記録を確認してください。'
+    if interaction.response.is_done():await interaction.followup.send(text,ephemeral=True)
+    else:await interaction.response.send_message(text,ephemeral=True)
+
+
+async def handle_roulette_prefix(message):
+    parts=message.content.split()
+    if not parts or parts[0]!='!arrl':return False
+    try:
+        if len(parts)!=3 or not re.fullmatch(r'[0-9]{1,7}',parts[1]):
+            raise ValueError('使い方：!arrl 投入額 賭け先（例：!arrl 100 red／!arrl 100 7、練習は投入額0）')
+        aliases={'red':'red','赤':'red','black':'black','黒':'black','odd':'odd','奇数':'odd','even':'even','偶数':'even'}
+        value=parts[2].lower()
+        choice=aliases.get(value)
+        target=None
+        if choice is None:
+            if not re.fullmatch(r'[0-9]{1,2}',value):
+                raise ValueError('賭け先はred・black・odd・even（日本語も可）、または0〜36の数字です。')
+            choice='number';target=int(value)
+        game=await asyncio.to_thread(points_store.roulette,message.guild.id,message.author.id,message.id,int(parts[1]),choice,target)
+        await message.reply(embed=roulette_embed(game),mention_author=False)
+    except ValueError as error:await message.reply(str(error),mention_author=False)
+    except (sqlite3.Error,discord.HTTPException) as error:
+        print(f'Roulette prefix failed: {error}')
+        await message.reply('処理または表示に失敗しました。!arp と !arwr で記録を確認してください。',mention_author=False)
+    return True
+
+
 client.run(TOKEN)
+
 
 
 
