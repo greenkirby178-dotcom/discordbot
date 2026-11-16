@@ -2066,7 +2066,11 @@ class RoulettePointsStore(DailyPointsStore):
                 bet INTEGER NOT NULL, pot INTEGER NOT NULL, active INTEGER NOT NULL DEFAULT 0,
                 choice TEXT NOT NULL, target INTEGER, number INTEGER NOT NULL, result TEXT NOT NULL)''')
 
-    def roulette(self,guild_id,user_id,request_id,bet,choice,target=None):
+            columns = {r['name'] for r in db.execute('PRAGMA table_info(roulette_games)')}
+            if 'number_bet' not in columns:
+                db.execute('ALTER TABLE roulette_games ADD COLUMN number_bet INTEGER NOT NULL DEFAULT 0')
+
+    def roulette(self,guild_id,user_id,request_id,bet,choice,target=None,number_bet=0):
         if not isinstance(bet,int) or not 0 <= bet <= 1000000:
             raise ValueError('投入額は0〜1,000,000ptで指定してください。')
         if choice not in ROULETTE_LABELS:
@@ -2074,8 +2078,17 @@ class RoulettePointsStore(DailyPointsStore):
         if choice == 'number':
             if not isinstance(target,int) or not 0 <= target <= 36:
                 raise ValueError('数字1点ではnumberに0〜36を指定してください。')
-        elif target is not None:
-            raise ValueError('numberは「数字1点」のときだけ指定できます。')
+        if not isinstance(number_bet,int) or not 0 <= number_bet <= 1000000:
+            raise ValueError('番号への追加投入額は0〜1,000,000ptです。')
+        if choice in ('red','black') and target is not None:
+            if not isinstance(target,int) or not 0 <= target <= 36:
+                raise ValueError('番号は0〜36です。')
+            if bet + number_bet > 0 and number_bet == 0:
+                raise ValueError('色と番号に同時に賭ける場合はnumber_betも指定してください。')
+        elif number_bet or (choice != 'number' and target is not None):
+            raise ValueError('番号への追加投入は赤・黒と番号を同時に選ぶ場合だけ指定できます。')
+        primary_bet = bet
+        bet += number_bet
         with self.transaction() as db:
             previous = db.execute('SELECT * FROM roulette_games WHERE request_id=?',(str(request_id),)).fetchone()
             if previous:
@@ -2087,14 +2100,21 @@ class RoulettePointsStore(DailyPointsStore):
                 raise ValueError(f'ポイントが足りません（利用可能：{balance:,}pt）。')
             number = secrets.randbelow(37)
             won = roulette_wins(number,choice,target)
-            payout = bet * (36 if choice == 'number' else 2) if won else 0
+            payout = primary_bet * (36 if choice == 'number' else 2) if won else 0
+            combo = choice in ('red','black') and target is not None
+            number_won = combo and number == target
+            if number_won:
+                payout += number_bet * 36
             game = dict(id=uuid.uuid4().hex,request_id=str(request_id),guild_id=guild_id,user_id=user_id,
                         bet=bet,pot=payout,active=0,choice=choice,target=target,number=number,
-                        result='✅ 的中！' if won else '❌ はずれ。投入分を失いました。')
+                        result='✅ 的中！' if won else '❌ はずれ。投入分を失いました。',number_bet=number_bet)
+            if combo:
+                game['result'] = (f"{ROULETTE_LABELS[choice]}：{'的中' if won else 'はずれ'}（基本受取{primary_bet*2 if won else 0:,}pt）\n"
+                                  f"{target}番：{'的中' if number_won else 'はずれ'}（基本受取{number_bet*36 if number_won else 0:,}pt）")
             self.change(db,game,-bet,'Roulette 挑戦開始')
             self.change(db,game,payout,'Roulette 挑戦精算')
-            db.execute('INSERT INTO roulette_games VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                       (game['id'],game['request_id'],guild_id,user_id,bet,game['pot'],0,choice,target,number,game['result']))
+            db.execute('INSERT INTO roulette_games(id,request_id,guild_id,user_id,bet,pot,active,choice,target,number,result,number_bet) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
+                       (game['id'],game['request_id'],guild_id,user_id,bet,game['pot'],0,choice,target,number,game['result'],number_bet))
             return game
 
 
@@ -2102,6 +2122,8 @@ def roulette_embed(game):
     number=game['number']
     color='🟢 緑' if number==0 else '🔴 赤' if number in ROULETTE_RED else '⚫ 黒'
     choice=str(game['target'])+'番' if game['choice']=='number' else ROULETTE_LABELS[game['choice']]
+    if game['choice'] in ('red','black') and game['target'] is not None:
+        choice += f" {game['bet']-game['number_bet']:,}pt ＋ {game['target']}番 {game['number_bet']:,}pt"
     embed=discord.Embed(title=f'🎰 ルーレット結果：{number}（{color}）',colour=0x00CC66)
     embed.description=(f"<@{game['user_id']}>｜賭け先：**{choice}**｜投入 **{game['bet']:,}pt**\n"
                        f"{game['result']}\n受取 **{game['pot']:,}pt**｜収支 **{game['pot']-game['bet']:+,}pt**")
@@ -2112,13 +2134,13 @@ def roulette_embed(game):
 
 @tree.command(name='roulette',description='赤黒・偶奇・数字を選んでルーレットを回します')
 @app_commands.guild_only()
-@app_commands.describe(choice='賭け先',bet='投入ポイント（省略・0なら練習）',number='数字1点を選んだ場合の番号（0〜36）')
+@app_commands.describe(choice='賭け先',bet='投入ポイント（省略・0なら練習）',number='数字1点または色と同時に賭ける番号（0〜36）',number_bet='色と番号を同時に賭けるときの番号への追加投入額')
 @app_commands.choices(choice=[app_commands.Choice(name=label,value=value) for value,label in ROULETTE_LABELS.items()])
 async def roulette_command(interaction:discord.Interaction,choice:str,bet:app_commands.Range[int,0,1000000]=0,
-                           number:app_commands.Range[int,0,36]|None=None):
+                           number:app_commands.Range[int,0,36]|None=None,number_bet:app_commands.Range[int,0,1000000]=0):
     await interaction.response.defer()
     try:
-        game=await asyncio.to_thread(points_store.roulette,interaction.guild_id,interaction.user.id,interaction.id,bet,choice,number)
+        game=await asyncio.to_thread(points_store.roulette,interaction.guild_id,interaction.user.id,interaction.id,bet,choice,number,number_bet)
         await interaction.followup.send(embed=roulette_embed(game))
     except ValueError as error:
         await interaction.followup.send(str(error),ephemeral=True)
@@ -2136,8 +2158,8 @@ async def handle_roulette_prefix(message):
     parts=message.content.split()
     if not parts or parts[0]!='!arrl':return False
     try:
-        if len(parts)!=3 or not re.fullmatch(r'[0-9]{1,7}',parts[1]):
-            raise ValueError('使い方：!arrl 投入額 賭け先（例：!arrl 100 red／!arrl 100 7、練習は投入額0）')
+        if len(parts) not in (3,5) or not re.fullmatch(r'[0-9]{1,7}',parts[1]):
+            raise ValueError('使い方：!arrl 投入額 賭け先 [番号 番号への投入額]（例：!arrl 100 red 7 20／!arrl 100 7）')
         aliases={'red':'red','赤':'red','black':'black','黒':'black','odd':'odd','奇数':'odd','even':'even','偶数':'even'}
         value=parts[2].lower()
         choice=aliases.get(value)
@@ -2146,7 +2168,12 @@ async def handle_roulette_prefix(message):
             if not re.fullmatch(r'[0-9]{1,2}',value):
                 raise ValueError('賭け先はred・black・odd・even（日本語も可）、または0〜36の数字です。')
             choice='number';target=int(value)
-        game=await asyncio.to_thread(points_store.roulette,message.guild.id,message.author.id,message.id,int(parts[1]),choice,target)
+        number_bet=0
+        if len(parts)==5:
+            if choice not in ('red','black') or not re.fullmatch(r'[0-9]{1,2}',parts[3]) or not re.fullmatch(r'[0-9]{1,7}',parts[4]):
+                raise ValueError('同時賭けの例：!arrl 100 red 7 20（赤100pt＋7番20pt）')
+            target=int(parts[3]);number_bet=int(parts[4])
+        game=await asyncio.to_thread(points_store.roulette,message.guild.id,message.author.id,message.id,int(parts[1]),choice,target,number_bet)
         await message.reply(embed=roulette_embed(game),mention_author=False)
     except ValueError as error:await message.reply(str(error),mention_author=False)
     except (sqlite3.Error,discord.HTTPException) as error:
@@ -2156,6 +2183,7 @@ async def handle_roulette_prefix(message):
 
 
 client.run(TOKEN)
+
 
 
 
