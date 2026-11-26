@@ -858,8 +858,20 @@ import unicodedata
 
 COURSE_CODES = {'MBC': 'マリオブラザーズサーキット', 'CC': 'トロフィーシティ', 'WS': 'シュポポコースター', 'DKS': 'DKうちゅうセンター', 'DD': 'サンサンさばく', 'SGB': 'ヘイホーカーニバル', 'WSr': 'ワリオスタジアム', 'AF': 'キラーシップ', 'DKP': 'DKスノーマウンテン', 'SP': 'ロゼッタてんもんだい', 'SHr': 'アイスビルディング', 'WSs': 'ワリオシップ', 'KTB': 'ノコノコビーチ', 'FO': 'リバーサイドサファリ', 'PS': 'ピーチスタジアム', 'PB': 'ピーチビーチ', 'SSS': 'ソルティータウン', 'DDJ': 'ディノディノジャングル', 'GBR': 'ハテナしんでん', 'CCF': 'プクプクフォールズ', 'DDD': 'ショーニューロード', 'BCi': 'おばけシネマ', 'FH': 'ホネホネツイスター', 'MMM': 'モーモーカントリー', 'CM': 'チョコマウンテン', 'TF': 'キノピオファクトリー', 'BC': 'クッパキャッスル', 'AH': 'どんぐりツリーハウス', 'MC': 'マリオサーキット', 'RR': 'レインボーロード'}
 
+# Ver. 1.9.0 courses use the existing course abbreviation followed by 2.
+COURSE_CODES.update({
+    "AF2": "キラーシップ 2",
+    "DD2": "サンサンさばく 2",
+    "SSS2": "ソルティータウン 2",
+    "DKP2": "DKスノーマウンテン 2",
+    "KTB2": "ノコノコビーチ 2",
+    "SGB2": "ヘイホーカーニバル 2",
+    "MBC2": "マリオブラザーズサーキット 2",
+    "WSr2": "ワリオスタジアム 2",
+})
+
 def course_key(value):
-    return unicodedata.normalize("NFKC", value).strip().casefold()
+    return "".join(unicodedata.normalize("NFKC", value).split()).casefold()
 
 TO_JAPANESE = {course_key(code): name for code, name in COURSE_CODES.items()}
 TO_CODE = {course_key(name): code for code, name in COURSE_CODES.items()}
