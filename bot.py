@@ -69,6 +69,15 @@ async def on_message(message):
         await asyncio.to_thread(points_store.record_chat, message.guild.id, message.author.id, message.id)
     except sqlite3.Error as error:
         print(f"Chat reward failed: {error}")
+    words = message.content.split()
+    if words and words[0] == "!chs":
+        choices = words[1:]
+        if choices:
+            await message.channel.send(random.choice(choices), allowed_mentions=discord.AllowedMentions.none())
+        else:
+            await message.channel.send("使い方: !chs 候補1 候補2 …")
+        return
+
     if await handle_roulette_prefix(message):
         return
     if await handle_bonus_prefix(message):
